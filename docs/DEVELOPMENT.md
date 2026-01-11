@@ -335,6 +335,13 @@ echo '{"graph":{"rankdir":"TB"},"nodes":[{"id":"A","width":100,"height":50}],"ed
 cargo build --target aarch64-apple-darwin  # or your native target
 ```
 
+If you want a repo-local override (without committing a machine-specific target),
+copy and edit:
+
+```bash
+cp .cargo/config.toml.example .cargo/config.toml
+```
+
 ---
 
 ## Resources

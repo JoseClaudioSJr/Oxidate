@@ -38,5 +38,8 @@ jobs:
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
-      - name: Run tests
+      - name: Run tests (default features)
         run: cargo test
+
+      - name: Run tests (no default features)
+        run: cargo test --no-default-features

@@ -20,3 +20,6 @@ tools/dagre-svg-demo/node_modules/
 
 # Generated files
 *.generated.rs
+
+# Local Cargo config (machine-specific target overrides)
+/.cargo/config.toml

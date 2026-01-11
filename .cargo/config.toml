@@ -1,5 +1,0 @@
-# Oxidate uses native target (not embedded)
-# This overrides the parent directory's config
-
-[build]
-target = "aarch64-apple-darwin"

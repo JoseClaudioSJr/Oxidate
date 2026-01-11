@@ -1,0 +1,17 @@
+# Optional local-only Cargo configuration.
+#
+# If your machine has a global Cargo config that forces an embedded target
+# (e.g. from a parent directory or ~/.cargo/config.toml), you can override it
+# for this repo by copying this file to `.cargo/config.toml` and setting your
+# native host target triple.
+#
+# Example host triples:
+# - macOS Apple Silicon: aarch64-apple-darwin
+# - macOS Intel:        x86_64-apple-darwin
+# - Linux x86_64:       x86_64-unknown-linux-gnu
+#
+# Copy + edit:
+#   cp .cargo/config.toml.example .cargo/config.toml
+#
+# [build]
+# target = "aarch64-apple-darwin"
