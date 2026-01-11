@@ -7,6 +7,10 @@ Oxidate is a Rust-based tool for designing, visualizing, and generating code fro
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)
 
+## GUI Demo
+
+- Video: [assets/gui-demo.mp4](assets/gui-demo.mp4)
+
 ---
 
 ## Features
@@ -248,33 +252,26 @@ oxidate/
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                         GUI (egui)                          │
-│  ┌─────────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │   Editor    │  │  Visualizer  │  │    Simulator      │  │
-│  │   Panel     │  │    Panel     │  │    Controls       │  │
-│  └──────┬──────┘  └──────┬───────┘  └─────────┬─────────┘  │
-└─────────┼────────────────┼──────────────────────┼───────────┘
-          │                │                      │
-          ▼                │                      │
-   ┌──────────────┐        │                      │
-   │    Parser    │        │                      │
-   │  (pest DSL)  │        │                      │
-   └──────┬───────┘        │                      │
-          │                │                      │
-          ▼                ▼                      │
-   ┌──────────────────────────────┐              │
-   │       FsmDefinition          │◄─────────────┘
-   │  (states, transitions, etc)  │
-   └──────────────┬───────────────┘
-                  │
-          ┌───────┴───────┐
-          ▼               ▼
-   ┌─────────────┐ ┌─────────────┐
-   │   Layout    │ │   Codegen   │
-   │  (Dagre/JS) │ │  (Rust)     │
-   └─────────────┘ └─────────────┘
+```mermaid
+flowchart TB
+    subgraph GUI[GUI (egui)]
+        E[Editor Panel]
+        V[Visualizer Panel]
+        S[Simulator Controls]
+    end
+
+    P[Parser (pest DSL)]
+    F[FsmDefinition\n(states, transitions, etc)]
+    L[Layout (Dagre/JS)]
+    C[Codegen (Rust)]
+    Sim[Simulation Runtime]
+
+    E --> P --> F
+    F --> C
+    F --> L --> V
+    S --> Sim
+    F --> Sim
+    Sim --> V
 ```
 
 ### Layout Pipeline
