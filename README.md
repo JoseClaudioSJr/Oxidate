@@ -254,14 +254,14 @@ oxidate/
 
 ```mermaid
 flowchart TB
-    subgraph GUI[GUI (egui)]
+    subgraph GUI["GUI (egui)"]
         E[Editor Panel]
         V[Visualizer Panel]
         S[Simulator Controls]
     end
 
     P[Parser (pest DSL)]
-    F[FsmDefinition\n(states, transitions, etc)]
+    F["FsmDefinition<br/>(states, transitions, etc)"]
     L[Layout (Dagre/JS)]
     C[Codegen (Rust)]
     Sim[Simulation Runtime]
