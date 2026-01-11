@@ -14,7 +14,9 @@ Oxidate is available in two editions:
 
 ### Pro Edition (Commercial License)
 
-Contact: GitHub Issues/Discussions
+Contact:
+- Issues: https://github.com/JoseClaudioSJr/Oxidate/issues
+- Discussions: https://github.com/JoseClaudioSJr/Oxidate/discussions
 
 #### Embassy Code Generation
 
@@ -103,8 +105,8 @@ oxidate-pro generate --target rtic your_fsm.fsm
 
 ## Support
 
-- Community Edition: GitHub Issues
-- Pro Edition: GitHub Issues/Discussions
+- Community Edition: https://github.com/JoseClaudioSJr/Oxidate/issues
+- Pro Edition: https://github.com/JoseClaudioSJr/Oxidate/discussions
 - Enterprise: Priority support + Slack channel
 
 ## FAQ

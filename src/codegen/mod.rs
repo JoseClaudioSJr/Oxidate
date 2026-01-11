@@ -13,7 +13,9 @@
 //! - **Embassy**: Async embedded with Active Object pattern
 //! - **RTIC**: Real-time embedded with event queues
 //! 
-//! Contact: GitHub Issues/Discussions
+//! Contact:
+//! - Issues: https://github.com/JoseClaudioSJr/Oxidate/issues
+//! - Discussions: https://github.com/JoseClaudioSJr/Oxidate/discussions
 
 use crate::fsm::FsmDefinition;
 
