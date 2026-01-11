@@ -13,7 +13,7 @@
 //! - **Embassy**: Async embedded with Active Object pattern
 //! - **RTIC**: Real-time embedded with event queues
 //! 
-//! Contact: oxidate@joseclaudio.dev
+//! Contact: GitHub Issues/Discussions
 
 use crate::fsm::FsmDefinition;
 

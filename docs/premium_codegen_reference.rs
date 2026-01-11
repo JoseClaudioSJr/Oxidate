@@ -5,7 +5,7 @@
 //! **NOT INCLUDED IN MIT RELEASE**
 //! 
 //! This file is maintained separately for Oxidate Pro.
-//! Contact: oxidate@joseclaudio.dev
+//! Contact: GitHub Issues/Discussions
 
 use crate::fsm::{FsmDefinition, StateType, Transition};
 
