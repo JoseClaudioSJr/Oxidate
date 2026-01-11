@@ -14,8 +14,8 @@ default = ["gui"]
 gui = []  # GUI editor (default)
 
 # Premium features (available separately)
-# embassy = []  # Embassy async code generation - see oxidate-pro
-# rtic = []     # RTIC real-time code generation - see oxidate-pro
+# embassy = []  # Embassy async code generation - see docs/PREMIUM_FEATURES.md
+# rtic = []     # RTIC real-time code generation - see docs/PREMIUM_FEATURES.md
 
 [dependencies]
 # GUI

@@ -22,7 +22,10 @@ Oxidate is a Rust-based tool for designing, visualizing, and generating code fro
 
 ### 🚀 Oxidate Pro
 
-For embedded development, check out [Oxidate Pro](https://github.com/joseclaudio/oxidate-pro):
+For embedded development, Oxidate Pro is available separately. Contact to purchase/access:
+
+- https://github.com/JoseClaudioSJr/Oxidate/discussions
+- https://github.com/JoseClaudioSJr/Oxidate/issues
 
 - **Embassy** — Async Active Object pattern for embedded
 - **RTIC** — Real-time event queues with priorities

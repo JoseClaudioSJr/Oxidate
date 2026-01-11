@@ -6,9 +6,9 @@
 //! 
 //! - **Standard** (MIT): Basic Rust FSM with states, events, and transitions
 //! 
-//! ### Premium Targets (oxidate-pro)
+//! ### Premium Targets (Oxidate Pro)
 //! 
-//! The following targets are available in [Oxidate Pro](https://github.com/joseclaudio/oxidate-pro):
+//! The following targets are available in Oxidate Pro (available separately):
 //! 
 //! - **Embassy**: Async embedded with Active Object pattern
 //! - **RTIC**: Real-time embedded with event queues
@@ -45,11 +45,11 @@ impl CodegenTarget {
             CodegenTarget::Standard => None,
             CodegenTarget::Embassy => Some(
                 "Embassy code generation is available in Oxidate Pro.\n\
-                 Visit: https://github.com/joseclaudio/oxidate-pro"
+                 Contact: https://github.com/JoseClaudioSJr/Oxidate/discussions"
             ),
             CodegenTarget::Rtic => Some(
                 "RTIC code generation is available in Oxidate Pro.\n\
-                 Visit: https://github.com/joseclaudio/oxidate-pro"
+                 Contact: https://github.com/JoseClaudioSJr/Oxidate/discussions"
             ),
         }
     }
@@ -83,8 +83,8 @@ fn generate_premium_stub(fsm: &FsmDefinition, target_name: &str) -> String {
          //! FSM: {}\n\
          //!\n\
          //! To generate {} code:\n\
-         //!   1. Get Oxidate Pro: https://github.com/joseclaudio/oxidate-pro\n\
-         //!   2. Use: oxidate-pro generate --target {} your_fsm.fsm\n\
+         //!   1. Purchase/access: https://github.com/JoseClaudioSJr/Oxidate/discussions\n\
+         //!   2. Then use: oxidate-pro generate --target {} your_fsm.fsm\n\
          //!\n\
          //! Oxidate Pro includes:\n\
          //!   - Embassy async Active Object pattern\n\
@@ -93,7 +93,7 @@ fn generate_premium_stub(fsm: &FsmDefinition, target_name: &str) -> String {
          //!   - HSM hierarchical states\n\
          //!   - Priority support\n\
          \n\
-         compile_error!(\"This target requires Oxidate Pro. Visit: https://github.com/joseclaudio/oxidate-pro\");\n",
+         compile_error!(\"This target requires Oxidate Pro. Contact: https://github.com/JoseClaudioSJr/Oxidate/discussions\");\n",
         target_name,
         fsm.name,
         target_name,
@@ -377,7 +377,7 @@ fn to_snake_case(s: &str) -> String {
 // ============================================================================
 // PREMIUM TARGETS (Embassy, RTIC)
 // ============================================================================
-// Available in Oxidate Pro: https://github.com/joseclaudio/oxidate-pro
+// Available in Oxidate Pro (separately): https://github.com/JoseClaudioSJr/Oxidate/discussions
 // 
 // Features include:
 // - Embassy Active Object pattern (async embedded)
@@ -385,4 +385,5 @@ fn to_snake_case(s: &str) -> String {
 // - Events with typed payloads
 // - HSM hierarchical states
 // - Software timers
-// - ISR-safe event posting// ============================================================================
+// - ISR-safe event posting
+// ============================================================================

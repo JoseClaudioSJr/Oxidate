@@ -94,8 +94,10 @@ impl<T: MotorActions, const N: usize> MotorFsm<T, N> {
 
 ## Getting Started with Pro
 
-1. Purchase license at https://github.com/joseclaudio/oxidate-pro
-2. Download oxidate-pro binary or crate
+1. Contact us to purchase a license and receive download/access instructions:
+    - https://github.com/JoseClaudioSJr/Oxidate/discussions
+    - https://github.com/JoseClaudioSJr/Oxidate/issues
+2. Download the Oxidate Pro binary/crate (link provided after purchase)
 3. Generate code:
 
 ```bash
