@@ -11,6 +11,8 @@ Oxidate is a Rust-based tool for designing, visualizing, and generating code fro
 
 - Video: [assets/gui-demo.mp4](assets/gui-demo.mp4)
 
+<img src="assets/gui-screenshot.png" alt="Oxidate GUI screenshot" width="100%" />
+
 ---
 
 ## Features
