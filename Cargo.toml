@@ -1,17 +1,32 @@
 [package]
-name = "oxidate"
+name = "oxidate-fsm"
 version = "0.1.0"
 edition = "2021"
 description = "FSM framework with GUI visualization - Mermaid-like DSL to Rust code generator"
 authors = ["Jose Claudio da Silva Junior"]
 license = "MIT"
-repository = "https://github.com/joseclaudio/oxidate"
+repository = "https://github.com/JoseClaudioSJr/Oxidate"
+homepage = "https://github.com/JoseClaudioSJr/Oxidate"
+documentation = "https://docs.rs/oxidate-fsm"
+readme = "README.md"
+rust-version = "1.70"
 keywords = ["fsm", "state-machine", "code-generator", "embedded", "gui"]
-categories = ["development-tools", "embedded", "gui"]
+categories = ["development-tools", "embedded"]
+
+# Keep the published crate small and focused.
+# (GUI demo assets and packaging/tooling remain available on GitHub.)
+include = [
+    "/Cargo.toml",
+    "/README.md",
+    "/LICENSE",
+    "/src/**",
+    "/examples/**",
+    "/docs/**",
+]
 
 [features]
 default = ["gui"]
-gui = []  # GUI editor (default)
+gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]  # GUI editor (default)
 
 # Premium features (available separately)
 # embassy = []  # Embassy async code generation - see docs/PREMIUM_FEATURES.md
@@ -19,9 +34,9 @@ gui = []  # GUI editor (default)
 
 [dependencies]
 # GUI
-eframe = "0.29"
-egui = "0.29"
-egui_extras = { version = "0.29", features = ["all_loaders"] }
+eframe = { version = "0.29", optional = true }
+egui = { version = "0.29", optional = true }
+egui_extras = { version = "0.29", features = ["all_loaders"], optional = true }
 
 # Parser
 pest = "2.7"
@@ -44,7 +59,7 @@ log = "0.4"
 env_logger = "0.11"
 
 # File dialog
-rfd = "0.14"
+rfd = { version = "0.14", optional = true }
 
 [package.metadata.bundle]
 name = "Oxidate"
@@ -66,9 +81,13 @@ assets = [
 	["tools/dagre-svg-demo/**", "usr/share/oxidate/tools/dagre-svg-demo/", "644"],
 ]
 
+[package.metadata.docs.rs]
+no-default-features = true
+
 [[bin]]
 name = "oxidate"
 path = "src/main.rs"
+required-features = ["gui"]
 
 [[bin]]
 name = "oxidate-cli"

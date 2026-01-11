@@ -9,9 +9,9 @@ Oxidate is a Rust-based tool for designing, visualizing, and generating code fro
 
 ## GUI Demo
 
-- Video: [assets/gui-demo.mp4](assets/gui-demo.mp4)
+- Video: https://github.com/JoseClaudioSJr/Oxidate/blob/main/assets/gui-demo.mp4
 
-<img src="assets/gui-screenshot.png" alt="Oxidate GUI screenshot" width="100%" />
+<img src="https://raw.githubusercontent.com/JoseClaudioSJr/Oxidate/main/assets/gui-screenshot.png" alt="Oxidate GUI screenshot" width="100%" />
 
 ---
 
@@ -50,8 +50,15 @@ For embedded development, Oxidate Pro is available separately. Contact to purcha
 ### Installation
 
 ```bash
+# Install from crates.io
+# GUI app + CLI (default features)
+cargo install oxidate-fsm
+
+# CLI-only (no GUI deps)
+cargo install oxidate-fsm --no-default-features
+
 # Clone the repository
-git clone https://github.com/joseclaudiosilva/oxidate.git
+git clone https://github.com/JoseClaudioSJr/Oxidate.git
 cd oxidate
 
 # Install JS layout dependencies
