@@ -119,10 +119,10 @@ pub struct State {
     pub description: Option<String>,
     /// State type
     pub state_type: StateType,
-    /// Entry action
-    pub entry_action: Option<Action>,
-    /// Exit action
-    pub exit_action: Option<Action>,
+    /// Entry actions (can have multiple)
+    pub entry_actions: Vec<Action>,
+    /// Exit actions (can have multiple)
+    pub exit_actions: Vec<Action>,
     /// Internal transitions (transitions that don't leave the state)
     pub internal_transitions: Vec<Transition>,
     /// For hierarchical states: nested FSM
@@ -137,8 +137,8 @@ impl State {
             name: name.into(),
             description: None,
             state_type,
-            entry_action: None,
-            exit_action: None,
+            entry_actions: Vec::new(),
+            exit_actions: Vec::new(),
             internal_transitions: Vec::new(),
             sub_fsm: None,
             position: None,

@@ -259,9 +259,9 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
                 ));
             }
             
-            // Exit action
+            // Exit actions
             if let Some(state) = fsm.states.iter().find(|s| s.name == transition.source) {
-                if let Some(ref exit_action) = state.exit_action {
+                for exit_action in &state.exit_actions {
                     code.push_str(&format!(
                         "                self.context.{}();\n",
                         to_snake_case(&exit_action.name)
@@ -283,9 +283,9 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
                 fsm.name, target
             ));
             
-            // Entry action
+            // Entry actions
             if let Some(state) = fsm.states.iter().find(|s| s.name == transition.target) {
-                if let Some(ref entry_action) = state.entry_action {
+                for entry_action in &state.entry_actions {
                     code.push_str(&format!(
                         "                self.context.{}();\n",
                         to_snake_case(&entry_action.name)
@@ -313,10 +313,10 @@ fn generate_action_trait(fsm: &FsmDefinition) -> String {
     let mut guards: Vec<String> = Vec::new();
     
     for state in &fsm.states {
-        if let Some(ref action) = state.entry_action {
+        for action in &state.entry_actions {
             actions.push(action.name.clone());
         }
-        if let Some(ref action) = state.exit_action {
+        for action in &state.exit_actions {
             actions.push(action.name.clone());
         }
     }

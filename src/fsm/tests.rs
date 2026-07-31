@@ -17,8 +17,8 @@ fn test_state_new() {
     assert_eq!(state.name, "Idle");
     assert_eq!(state.state_type, StateType::Simple);
     assert!(state.description.is_none());
-    assert!(state.entry_action.is_none());
-    assert!(state.exit_action.is_none());
+    assert!(state.entry_actions.is_empty());
+    assert!(state.exit_actions.is_empty());
 }
 
 #[test]

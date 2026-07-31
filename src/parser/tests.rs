@@ -55,12 +55,39 @@ fn test_parse_state_with_entry_exit() {
     let fsm = &fsms[0];
     let active = fsm.states.iter().find(|s| s.name == "Active").unwrap();
     
-    assert!(active.entry_action.is_some());
-    assert_eq!(active.entry_action.as_ref().unwrap().name, "on_enter");
+    assert_eq!(active.entry_actions.len(), 1);
+    assert_eq!(active.entry_actions[0].name, "on_enter");
     
-    assert!(active.exit_action.is_some());
-    assert_eq!(active.exit_action.as_ref().unwrap().name, "on_exit");
+    assert_eq!(active.exit_actions.len(), 1);
+    assert_eq!(active.exit_actions[0].name, "on_exit");
 }
+#[test]
+fn test_parse_state_with_multiple_entry_exit() {
+    let source = r#"
+        fsm Test {
+            [*] --> Active
+            state Active {
+                entry / on_enter_v1()
+                entry / on_enter_v2()
+                exit / on_exit_v1()
+                exit / on_exit_v2()
+            }
+        }
+    "#;
+
+    let fsms = parse_fsm(source).expect("Should parse successfully");
+    let fsm = &fsms[0];
+    let active = fsm.states.iter().find(|s| s.name == "Active").unwrap();
+    
+    assert_eq!(active.entry_actions.len(), 2);
+    assert_eq!(active.entry_actions[0].name, "on_enter_v1");
+    assert_eq!(active.entry_actions[1].name, "on_enter_v2");
+
+    assert_eq!(active.exit_actions.len(), 2);
+    assert_eq!(active.exit_actions[0].name, "on_exit_v1");
+    assert_eq!(active.exit_actions[1].name, "on_exit_v2");
+}
+
 
 #[test]
 fn test_parse_transition_with_event() {

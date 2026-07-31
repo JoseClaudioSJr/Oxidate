@@ -2688,11 +2688,11 @@ fn estimate_state_size(state: &fsm::State) -> egui::Vec2 {
     let mut action_lines = 0;
     let mut max_action_len = 0;
     
-    if let Some(ref entry) = state.entry_action {
+    for entry in &state.entry_actions {
         action_lines += 1;
         max_action_len = max_action_len.max(entry.name.len() + 7); // "entry/ "
     }
-    if let Some(ref exit) = state.exit_action {
+    for exit in &state.exit_actions {
         action_lines += 1;
         max_action_len = max_action_len.max(exit.name.len() + 6); // "exit/ "
     }
@@ -2772,10 +2772,10 @@ fn calculate_state_levels(fsm: &fsm::FsmDefinition) -> std::collections::HashMap
 /// Calculate the bounding rectangle for a state (used for routing and collision)
 fn calculate_state_rect(state: &fsm::State, pos: egui::Pos2, zoom: f32) -> egui::Rect {
     let mut action_lines = Vec::new();
-    if let Some(ref entry) = state.entry_action {
+    for entry in &state.entry_actions {
         action_lines.push(format!("entry/ {}", entry.name));
     }
-    if let Some(ref exit) = state.exit_action {
+    for exit in &state.exit_actions {
         action_lines.push(format!("exit/ {}", exit.name));
     }
     
@@ -2815,10 +2815,10 @@ fn draw_state(
 ) {
     // Calculate content for dynamic sizing
     let mut action_lines = Vec::new();
-    if let Some(ref entry) = state.entry_action {
+    for entry in &state.entry_actions {
         action_lines.push(format!("entry/ {}", entry.name));
     }
-    if let Some(ref exit) = state.exit_action {
+    for exit in &state.exit_actions {
         action_lines.push(format!("exit/ {}", exit.name));
     }
     

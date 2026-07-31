@@ -112,8 +112,8 @@ fn parse_fsm_item(pair: pest::iterators::Pair<Rule>, fsm: &mut FsmDefinition) ->
             // Update existing or add new
             if let Some(existing) = fsm.states.iter_mut().find(|s| s.name == state.name) {
                 existing.description = state.description;
-                existing.entry_action = state.entry_action;
-                existing.exit_action = state.exit_action;
+                existing.entry_actions.extend(state.entry_actions);
+                existing.exit_actions.extend(state.exit_actions);
                 existing.internal_transitions = state.internal_transitions;
             } else {
                 fsm.states.push(state);
@@ -263,11 +263,11 @@ fn parse_state_definition(pair: pest::iterators::Pair<Rule>) -> ParseResult<Stat
             }
             Rule::entry_action => {
                 let action = parse_action_call(item.into_inner().next().unwrap())?;
-                state.entry_action = Some(action);
+                state.entry_actions.push(action);
             }
             Rule::exit_action => {
                 let action = parse_action_call(item.into_inner().next().unwrap())?;
-                state.exit_action = Some(action);
+                state.exit_actions.push(action);
             }
             Rule::internal_action => {
                 let mut action_inner = item.into_inner();
@@ -296,23 +296,20 @@ fn parse_state_body_item(pair: pest::iterators::Pair<Rule>, state: &mut State) -
     match action_item.as_rule() {
         Rule::entry_action => {
             let action = parse_action_call(action_item.into_inner().next().unwrap())?;
-            state.entry_action = Some(action);
+            state.entry_actions.push(action);
         }
         Rule::exit_action => {
             let action = parse_action_call(action_item.into_inner().next().unwrap())?;
-            state.exit_action = Some(action);
+            state.exit_actions.push(action);
         }
         Rule::timer_start => {
-            // Add timer start to entry actions or create a composite action
+            // Add timer start to entry actions
             let timer_name = action_item.into_inner().next().unwrap().as_str().to_string();
             let action = Action {
                 name: format!("start_timer_{}", timer_name),
                 params: vec![timer_name],
             };
-            // Append to entry action or create new
-            if state.entry_action.is_none() {
-                state.entry_action = Some(action);
-            }
+            state.entry_actions.push(action);
         }
         Rule::timer_stop => {
             // Add timer stop to exit actions
@@ -321,9 +318,7 @@ fn parse_state_body_item(pair: pest::iterators::Pair<Rule>, state: &mut State) -
                 name: format!("stop_timer_{}", timer_name),
                 params: vec![timer_name],
             };
-            if state.exit_action.is_none() {
-                state.exit_action = Some(action);
-            }
+            state.exit_actions.push(action);
         }
         Rule::internal_transition => {
             // Internal transition with optional guard: event [guard] / action
