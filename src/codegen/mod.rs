@@ -19,6 +19,9 @@
 
 use crate::fsm::FsmDefinition;
 
+#[cfg(test)]
+mod tests;
+
 /// Code generation target
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodegenTarget {
