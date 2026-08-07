@@ -39,8 +39,12 @@ egui = { version = "0.29", optional = true }
 egui_extras = { version = "0.29", features = ["all_loaders"], optional = true }
 
 # Parser
-pest = "2.7"
-pest_derive = "2.7"
+# Upper-bounded on purpose: pest 2.8 raises its own MSRV to rustc 1.83, which
+# would silently break the `rust-version = "1.70"` declared above for anyone on
+# a cargo older than the MSRV-aware resolver (< 1.84). pest is an internal
+# implementation detail here, so capping it costs downstream users nothing.
+pest = ">=2.7, <2.8"
+pest_derive = ">=2.7, <2.8"
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }

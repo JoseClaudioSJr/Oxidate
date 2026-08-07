@@ -157,11 +157,18 @@ fn generate_state_enum(fsm: &FsmDefinition) -> String {
 fn generate_event_enum(fsm: &FsmDefinition) -> String {
     let mut code = String::new();
     
-    // Collect unique events
+    // Collect unique events from external transitions...
     let mut events: Vec<String> = fsm.transitions
         .iter()
         .filter_map(|t| t.event.as_ref().map(|e| e.name.clone()))
         .collect();
+    // ...and from internal transitions declared inside state bodies.
+    events.extend(
+        fsm.states
+            .iter()
+            .flat_map(|s| s.internal_transitions.iter())
+            .filter_map(|t| t.event.as_ref().map(|e| e.name.clone())),
+    );
     events.sort();
     events.dedup();
     
@@ -235,10 +242,70 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
     
     code.push_str(&format!("    pub fn process(&mut self, event: {}Event) {{\n", fsm.name));
     code.push_str("        match (self.state, event) {\n");
-    
+
+    // Internal transitions are emitted first: per UML semantics they take
+    // precedence over external transitions on the same (state, event) pair.
+    // They run their action without leaving the state, so no exit/entry
+    // actions and no state change.
+    for state in &fsm.states {
+        for internal in &state.internal_transitions {
+            let Some(ref event) = internal.event else {
+                continue;
+            };
+            let source = to_pascal_case(&state.name);
+            let event_name = to_pascal_case(&event.name);
+
+            if let Some(ref guard) = internal.guard {
+                code.push_str(&format!(
+                    "            ({}State::{}, {}Event::{}) if self.context.{} => {{\n",
+                    fsm.name, source, fsm.name, event_name, to_snake_case(&guard.expression)
+                ));
+            } else {
+                code.push_str(&format!(
+                    "            ({}State::{}, {}Event::{}) => {{\n",
+                    fsm.name, source, fsm.name, event_name
+                ));
+            }
+
+            if let Some(ref action) = internal.action {
+                code.push_str(&format!(
+                    "                self.context.{}();\n",
+                    to_snake_case(&action.name)
+                ));
+            }
+
+            code.push_str("                // Internal transition: state unchanged\n");
+            code.push_str("            }\n");
+        }
+    }
+
+    // A (state, event) pair already handled by an unguarded internal
+    // transition is unreachable below, so skip it to avoid emitting code
+    // that trips `unreachable_patterns` in the user's crate.
+    let shadowed: Vec<(String, String)> = fsm
+        .states
+        .iter()
+        .flat_map(|s| s.internal_transitions.iter())
+        .filter(|t| t.guard.is_none())
+        .filter_map(|t| {
+            t.event
+                .as_ref()
+                .map(|e| (t.source.clone(), e.name.clone()))
+        })
+        .collect();
+
     for transition in &fsm.transitions {
         if transition.source == "[*]" {
             continue; // Skip initial transitions
+        }
+
+        if let Some(ref event) = transition.event {
+            if shadowed
+                .iter()
+                .any(|(s, e)| *s == transition.source && *e == event.name)
+            {
+                continue;
+            }
         }
         
         if let Some(ref event) = transition.event {
@@ -318,6 +385,14 @@ fn generate_action_trait(fsm: &FsmDefinition) -> String {
         }
         for action in &state.exit_actions {
             actions.push(action.name.clone());
+        }
+        for internal in &state.internal_transitions {
+            if let Some(ref action) = internal.action {
+                actions.push(action.name.clone());
+            }
+            if let Some(ref guard) = internal.guard {
+                guards.push(guard.expression.clone());
+            }
         }
     }
     
