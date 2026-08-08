@@ -131,6 +131,46 @@ fn every_example_generates_code_that_compiles_and_passes_its_tests() {
 }
 
 #[test]
+fn generated_code_can_be_consumed_with_include() {
+    // `include!(concat!(env!("OUT_DIR"), "/machine.rs"))` is how build.rs output
+    // is normally consumed. It splices the file into an existing module, where an
+    // inner doc comment (`//!`) is illegal — so the header and usage docs must
+    // not use one.
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("generated_include");
+    std::fs::create_dir_all(&dir).expect("temp dir");
+
+    let source = std::fs::read_to_string(examples_dir().join("traffic_light.fsm"))
+        .expect("example should be readable");
+    let fsms = parse_fsm(&source).expect("should parse");
+    let code = generate_rust_code(&fsms[0]).expect("should generate");
+
+    let generated = dir.join("machine.rs");
+    std::fs::write(&generated, &code).expect("write generated");
+
+    let wrapper = dir.join("wrapper.rs");
+    std::fs::write(
+        &wrapper,
+        "pub mod machine {\n    include!(\"machine.rs\");\n}\n",
+    )
+    .expect("write wrapper");
+
+    let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".to_string());
+    let out = Command::new(&rustc)
+        .args(["--crate-type", "lib", "--edition", "2021"])
+        .arg("-o")
+        .arg(dir.join("libwrapper.rlib"))
+        .arg(&wrapper)
+        .output()
+        .expect("run rustc");
+
+    assert!(
+        out.status.success(),
+        "generated code cannot be used via include!:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn known_rejected_entries_refer_to_real_examples() {
     // Guards against a typo silently disabling the check for an example.
     let names: Vec<String> = fsm_files().iter().map(|p| stem(p)).collect();
