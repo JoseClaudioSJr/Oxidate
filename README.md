@@ -199,22 +199,82 @@ StateX --> <<CheckCondition>> : evaluate
 Oxidate generates idiomatic Rust code for three targets:
 
 ### Standard Rust
+
+From `examples/traffic_light.fsm`:
+
 ```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrafficLightState {
     Red,
     Yellow,
     Green,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TrafficLightEvent {
-    TimerExpired,
+    GreenExpired,
+    RedExpired,
+    YellowExpired,
 }
 
-impl TrafficLight {
-    pub fn handle_event(&mut self, event: TrafficLightEvent) {
-        // Generated transition logic
+/// Your code implements this; the machine calls into it.
+pub trait TrafficLightActions {
+    fn display_green(&mut self);
+    fn display_red(&mut self);
+    fn display_yellow(&mut self);
+    fn start_timer(&mut self);
+}
+
+pub struct TrafficLight<T: TrafficLightActions> {
+    state: TrafficLightState,
+    context: T,
+}
+
+impl<T: TrafficLightActions> TrafficLight<T> {
+    pub fn new(context: T) -> Self { /* ... */ }
+    pub fn state(&self) -> TrafficLightState { self.state }
+
+    /// Runs exit actions, the transition action, then entry actions.
+    pub fn process(&mut self, event: TrafficLightEvent) { /* ... */ }
+}
+```
+
+The generated code has no dependencies and no allocations — it is a plain enum
+plus a `match`, so it drops into a `no_std` crate as-is.
+
+### Programmatic Use (Library API)
+
+Beyond the GUI and the CLI, `oxidate-fsm` can be used as a library, for example
+from a `build.rs`:
+
+```rust
+use oxidate_fsm::{parse_fsm, generate_rust_code};
+
+let source = std::fs::read_to_string("machine.fsm")?;
+
+// One file may declare several machines, hence the Vec.
+let fsms = parse_fsm(&source)?;
+
+for fsm in &fsms {
+    match generate_rust_code(fsm) {
+        Ok(code) => std::fs::write(format!("{}.rs", fsm.name), code)?,
+        Err(errors) => eprintln!("{}: {}", fsm.name, errors.join("; ")),
     }
 }
+```
+
+`generate_rust_code` returns `Result<String, Vec<String>>`. The error case covers
+definitions that would produce code that does not compile — a missing initial
+state, a transition pointing at a state that was never declared, or two names
+that collapse into the same Rust identifier (`idle_state` and `IdleState` both
+become the variant `IdleState`).
+
+To pick a backend explicitly:
+
+```rust
+use oxidate_fsm::codegen::{generate_rust_code_with_target, CodegenTarget};
+
+let code = generate_rust_code_with_target(fsm, CodegenTarget::Standard)?;
 ```
 
 ### Embassy (Async Embedded)
