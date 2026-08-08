@@ -849,3 +849,94 @@ fn test_usage_doc_is_attached_to_the_struct() {
         "usage doc is detached from the struct"
     );
 }
+
+/// An internal transition and an external self-transition on the same event.
+/// UML gives the internal one precedence, so the external one never runs.
+const SHADOWED: &str = r#"
+    fsm VendingMachine {
+        [*] --> Idle
+        state Idle { entry / display_welcome() }
+        state AcceptingCoins {
+            entry / show_balance()
+            CoinInserted / add_to_balance()
+        }
+        Idle --> AcceptingCoins : CoinInserted
+        AcceptingCoins --> AcceptingCoins : CoinInserted / add_coin()
+        AcceptingCoins --> Idle : Cancel / return_coins()
+    }
+"#;
+
+#[test]
+fn test_shadowed_action_is_not_required_by_the_trait() {
+    // `add_coin` belongs to the transition the internal one takes precedence
+    // over. Declaring it forced the implementer to write a dead method.
+    let code = generate(SHADOWED);
+
+    let trait_block = code
+        .split("pub trait VendingMachineActions {")
+        .nth(1)
+        .expect("trait missing");
+    let trait_block = trait_block.split('}').next().unwrap();
+
+    assert!(
+        !trait_block.contains("add_coin"),
+        "trait still requires an action that can never run:\n{trait_block}"
+    );
+    // The internal transition's own action is still needed.
+    assert!(trait_block.contains("fn add_to_balance(&mut self);"));
+    assert!(trait_block.contains("fn return_coins(&mut self);"));
+}
+
+#[test]
+fn test_shadowed_transition_is_reported_in_the_output() {
+    // Dropping it silently leaves the author wondering why nothing happens.
+    let code = generate(SHADOWED);
+
+    assert!(
+        code.contains("// Note: 'AcceptingCoins --> AcceptingCoins")
+            && code.contains("can never run"),
+        "no note explaining the dropped transition:\n{code}"
+    );
+}
+
+#[test]
+fn test_shadowed_guard_is_not_required_either() {
+    let code = generate(
+        r#"
+        fsm Probe {
+            [*] --> Busy
+            state Busy {
+                Poke / handle_internally()
+            }
+            Busy --> Busy : Poke [ready] / handle_externally()
+        }
+    "#,
+    );
+
+    // The external arm is guarded, so it is *not* shadowed: a guarded internal
+    // transition would be needed for that. Here the internal one is unguarded,
+    // so it does take precedence and both the action and the guard go away.
+    assert!(!code.contains("fn handle_externally(&mut self);"));
+    assert!(!code.contains("fn ready(&self) -> bool;"));
+}
+
+#[test]
+fn test_a_guarded_internal_transition_does_not_shadow() {
+    // It can evaluate false, leaving the external transition reachable, so its
+    // action must stay in the trait.
+    let code = generate(
+        r#"
+        fsm Probe {
+            [*] --> Busy
+            state Busy {
+                Poke [maybe] / handle_internally()
+            }
+            state Done
+            Busy --> Done : Poke / handle_externally()
+        }
+    "#,
+    );
+
+    assert!(code.contains("fn handle_externally(&mut self);"));
+    assert!(!code.contains("// Note:"), "nothing should be reported as dropped");
+}
