@@ -92,7 +92,17 @@ impl FsmDefinition {
                     transition.source
                 ));
             }
-            if transition.target != "[*]"
+            // `<<Name>>` targets a choice point, which is resolved at
+            // generation time rather than being a state of its own.
+            let choice_target = transition
+                .target
+                .strip_prefix("<<")
+                .and_then(|t| t.strip_suffix(">>"));
+            if let Some(name) = choice_target {
+                if !self.choice_points.iter().any(|c| c.name == name) {
+                    errors.push(format!("Choice point '{name}' is not defined"));
+                }
+            } else if transition.target != "[*]"
                 && !self.states.iter().any(|s| s.name == transition.target)
             {
                 errors.push(format!(
