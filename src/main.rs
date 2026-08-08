@@ -452,6 +452,7 @@ impl OxidateApp {
     /// for them rather than leaving them to land on top of a state box.
     fn compute_layout_native(&mut self, fsm: &FsmDefinition) {
         use dagre::graph::{Graph, GraphOptions};
+        use dagre::layout::types::LabelPos;
         use dagre::{layout, EdgeLabel, LayoutOptions, NodeLabel, RankDir};
 
         let mut g: Graph<NodeLabel, EdgeLabel> = Graph::with_options(GraphOptions {
@@ -496,6 +497,13 @@ impl OxidateApp {
             // with, and dagre needs the size to reserve space for them.
             let text = format_label_text(&transition.label());
             let mut label = EdgeLabel::default();
+            // `EdgeLabel::default()` uses LabelPos::Right, which makes dagre add
+            // `labeloffset` to the edge width and then shift the label sideways.
+            // The route detours through that inflated point, producing a visible
+            // kink beside every label. Centred, the label sits on the line and
+            // the route stays straight; the label's opaque background hides the
+            // segment underneath.
+            label.labelpos = LabelPos::Center;
             if !text.is_empty() {
                 let font = self.layout_config.edge_label_font_size as f64;
                 let widest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
@@ -585,24 +593,73 @@ impl OxidateApp {
             self.state_positions.insert(name.clone(), *p - centre);
         }
 
+        // The boxes as drawn, in the same centred space as the routes. Used to
+        // clip edge endpoints onto the border instead of trusting the numbers
+        // to line up.
+        let mut boxes: std::collections::HashMap<String, egui::Rect> =
+            std::collections::HashMap::new();
+        for state in &fsm.states {
+            if let Some(&p) = raw.get(&state.name) {
+                boxes.insert(
+                    state.name.clone(),
+                    egui::Rect::from_center_size(p - centre, estimate_state_size(state)),
+                );
+            }
+        }
+        if let Some(&p) = raw.get("[*]") {
+            boxes.insert(
+                "[*]".to_string(),
+                egui::Rect::from_center_size(p - centre, egui::vec2(16.0, 16.0)),
+            );
+        }
+
         let mut edges: Vec<LayoutedEdge> = Vec::new();
         let mut labels: Vec<LayoutedLabel> = Vec::new();
+        let mut self_loops = 0usize;
+        // (index into `edges`, text, forced position for self-loops)
+        let mut pending_labels: Vec<(usize, String, Option<egui::Pos2>)> = Vec::new();
 
         for (index, source, target, name) in &edge_keys {
             let Some(e) = g.edge(source.as_str(), target.as_str(), Some(name)) else {
                 continue;
             };
 
-            let points: Vec<egui::Pos2> = e
+            let raw_points: Vec<egui::Pos2> = e
                 .points
                 .iter()
                 .map(|p| egui::pos2(p.x as f32, p.y as f32) - centre)
                 .collect();
+            let transition = &fsm.transitions[*index];
+            let text = format_label_text(&transition.label());
+
+            // Only 0/90/180 degree segments: no diagonals.
+            let mut points = orthogonalise(&raw_points, self.layout_config.direction, *index);
+            let mut self_loop_label: Option<egui::Pos2> = None;
+
+            // A self-edge gets its own loop: dagre's geometry for these does not
+            // survive being squared off.
+            if source == target {
+                if let Some(&rect) = boxes.get(source) {
+                    // The loop has to enclose its label, so its width depends on
+                    // the label's.
+                    let label_w =
+                        label_box_width(&text, self.layout_config.edge_label_font_size);
+                    let reach =
+                        rect.right() + 20.0 + label_w + self_loops as f32 * 18.0;
+                    points = self_loop_route(rect, reach);
+                    self_loop_label = Some(egui::pos2(
+                        rect.right() + 10.0 + label_w * 0.5,
+                        rect.center().y,
+                    ));
+                    self_loops += 1;
+                }
+            } else if let (Some(&from), Some(&to)) = (boxes.get(source), boxes.get(target)) {
+                points = clip_route_to_boxes(&points, from, to);
+            }
+
             if points.len() < 2 {
                 continue;
             }
-
-            let transition = &fsm.transitions[*index];
 
             // "Reverse" means the target sits earlier along the rank direction,
             // which is what the renderer colours differently.
@@ -614,15 +671,8 @@ impl OxidateApp {
                 _ => false,
             };
 
-            let text = format_label_text(&transition.label());
-            if !text.is_empty() {
-                if let (Some(x), Some(y)) = (e.x, e.y) {
-                    labels.push(LayoutedLabel {
-                        pos: egui::pos2(x as f32, y as f32) - centre,
-                        text,
-                    });
-                }
-            }
+            // Positioned once the routes are final: see below.
+            pending_labels.push((edges.len(), text, self_loop_label));
 
             edges.push(LayoutedEdge {
                 v: source.clone(),
@@ -635,11 +685,15 @@ impl OxidateApp {
 
         if let Some(target) = initial.as_ref() {
             if let Some(e) = g.edge("[*]", target.as_str(), Some(&"__initial".to_string())) {
-                let points: Vec<egui::Pos2> = e
+                let raw_points: Vec<egui::Pos2> = e
                     .points
                     .iter()
                     .map(|p| egui::pos2(p.x as f32, p.y as f32) - centre)
                     .collect();
+                let mut points = orthogonalise(&raw_points, self.layout_config.direction, 0);
+                if let (Some(&from), Some(&to)) = (boxes.get("[*]"), boxes.get(target.as_str())) {
+                    points = clip_route_to_boxes(&points, from, to);
+                }
                 if points.len() >= 2 {
                     edges.push(LayoutedEdge {
                         v: "[*]".to_string(),
@@ -650,6 +704,18 @@ impl OxidateApp {
                     });
                 }
             }
+        }
+
+        // Even out where edges meet each box, then anchor every label on the
+        // geometry that actually got drawn.
+        distribute_endpoints(&mut edges, &boxes);
+
+        for (edge_index, text, forced) in pending_labels {
+            if text.is_empty() {
+                continue;
+            }
+            let pos = forced.unwrap_or_else(|| label_anchor(&edges[edge_index].points));
+            labels.push(LayoutedLabel { pos, text });
         }
 
         self.layout = Some(LayoutedDiagram { edges, labels });
@@ -1915,10 +1981,18 @@ fn draw_orthogonal_arrow_colored(painter: &egui::Painter, route: &[egui::Pos2], 
         painter.line_segment([route[i], route[i + 1]], stroke);
     }
     
-    // Draw arrowhead at the end
+    // Arrowhead direction: the last segment with usable length. Taking the
+    // final pair blindly points the head in a meaningless direction whenever
+    // the route ends with a very short jog.
     let last = route[route.len() - 1];
-    let prev = route[route.len() - 2];
-    let dir = (last - prev).normalized();
+    let dir = route
+        .iter()
+        .rev()
+        .skip(1)
+        .map(|p| last - *p)
+        .find(|v| v.length() > 1.0)
+        .map(|v| v.normalized())
+        .unwrap_or(egui::vec2(0.0, 1.0));
     
     let arrow_size = 10.0 * zoom;
     let arrow_angle = 0.4;
@@ -1977,36 +2051,357 @@ fn draw_grid(painter: &egui::Painter, rect: egui::Rect, zoom: f32, offset: egui:
 }
 
 /// Estimate the visual size of a state box
+/// Which side of a box a route point sits on.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+enum BoxSide {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+fn side_of(point: egui::Pos2, rect: egui::Rect) -> BoxSide {
+    // Endpoints are already clipped onto the border, so the smallest distance
+    // identifies the side unambiguously.
+    let candidates = [
+        (BoxSide::Top, (point.y - rect.top()).abs()),
+        (BoxSide::Bottom, (point.y - rect.bottom()).abs()),
+        (BoxSide::Left, (point.x - rect.left()).abs()),
+        (BoxSide::Right, (point.x - rect.right()).abs()),
+    ];
+    candidates
+        .iter()
+        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        .map(|(side, _)| *side)
+        .unwrap()
+}
+
+/// Spreads the endpoints meeting one side of a box evenly along it.
+///
+/// dagre picks where each edge meets a node, and after the route has been
+/// squared off and clipped those positions look arbitrary — two arrows landing a
+/// few pixels apart, a third far away. Distributing them turns a cluster into a
+/// comb.
+///
+/// Moving an endpoint also moves the elbow feeding it, which is what keeps the
+/// final segment axis-aligned; as a side effect parallel elbows line up.
+fn distribute_endpoints(
+    edges: &mut [LayoutedEdge],
+    boxes: &std::collections::HashMap<String, egui::Rect>,
+) {
+    // (box name, side, is_arrival) -> indices of edges meeting there
+    let mut groups: std::collections::HashMap<(String, BoxSide, bool), Vec<usize>> =
+        std::collections::HashMap::new();
+
+    for (i, edge) in edges.iter().enumerate() {
+        if edge.v == edge.w || edge.points.len() < 2 {
+            continue; // self-loops carry their own geometry
+        }
+        if let Some(rect) = boxes.get(&edge.v) {
+            let side = side_of(edge.points[0], *rect);
+            groups.entry((edge.v.clone(), side, false)).or_default().push(i);
+        }
+        if let Some(rect) = boxes.get(&edge.w) {
+            let side = side_of(edge.points[edge.points.len() - 1], *rect);
+            groups.entry((edge.w.clone(), side, true)).or_default().push(i);
+        }
+    }
+
+    for ((name, side, is_arrival), mut members) in groups {
+        if members.len() < 2 {
+            continue;
+        }
+        let Some(&rect) = boxes.get(&name) else {
+            continue;
+        };
+
+        let horizontal_side = matches!(side, BoxSide::Top | BoxSide::Bottom);
+        let coord = |edge: &LayoutedEdge| {
+            let p = if is_arrival {
+                edge.points[edge.points.len() - 1]
+            } else {
+                edge.points[0]
+            };
+            if horizontal_side {
+                p.x
+            } else {
+                p.y
+            }
+        };
+
+        // Keep the existing left-to-right (or top-to-bottom) order so edges
+        // don't cross each other just to be evenly spaced.
+        members.sort_by(|a, b| {
+            coord(&edges[*a])
+                .partial_cmp(&coord(&edges[*b]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+
+        let (lo, hi) = if horizontal_side {
+            let inset = rect.width() * 0.15;
+            (rect.left() + inset, rect.right() - inset)
+        } else {
+            let inset = rect.height() * 0.15;
+            (rect.top() + inset, rect.bottom() - inset)
+        };
+        let count = members.len();
+
+        for (slot, edge_index) in members.into_iter().enumerate() {
+            let target = lo + (hi - lo) * (slot as f32 + 1.0) / (count as f32 + 1.0);
+            let edge = &mut edges[edge_index];
+            let n = edge.points.len();
+            let (end, neighbour) = if is_arrival { (n - 1, n - 2) } else { (0, 1) };
+
+            if horizontal_side {
+                // Final segment is vertical: shift both x to keep it so.
+                if (edge.points[end].x - edge.points[neighbour].x).abs() < 0.5 {
+                    edge.points[neighbour].x = target;
+                }
+                edge.points[end].x = target;
+            } else {
+                if (edge.points[end].y - edge.points[neighbour].y).abs() < 0.5 {
+                    edge.points[neighbour].y = target;
+                }
+                edge.points[end].y = target;
+            }
+        }
+    }
+}
+
+/// Midpoint of a route's longest straight segment.
+///
+/// The label belongs on the line it describes. dagre's own label coordinate
+/// refers to the diagonal route it produced, which no longer exists after the
+/// route is squared off, clipped and redistributed — so it is computed from the
+/// final geometry instead.
+fn label_anchor(points: &[egui::Pos2]) -> egui::Pos2 {
+    let mut best = points[0];
+    let mut best_len = -1.0_f32;
+    for pair in points.windows(2) {
+        let len = (pair[1] - pair[0]).length();
+        if len > best_len {
+            best_len = len;
+            best = pair[0] + (pair[1] - pair[0]) * 0.5;
+        }
+    }
+    best
+}
+
+/// Forces the first and last points of an axis-aligned route onto the borders of
+/// the boxes it connects.
+///
+/// dagre computes endpoints against the node rect it was given, but any
+/// rewriting we do afterwards — and any rounding along the way — can leave the
+/// arrowhead floating short of the box or buried inside it. Clipping against the
+/// rect we actually draw makes the endpoint correct by construction.
+fn clip_route_to_boxes(
+    points: &[egui::Pos2],
+    source: egui::Rect,
+    target: egui::Rect,
+) -> Vec<egui::Pos2> {
+    const EPS: f32 = 0.5;
+
+    let mut pts: Vec<egui::Pos2> = points.to_vec();
+    if pts.len() < 2 {
+        return pts;
+    }
+
+    // Points buried inside a box are invisible; dropping them means the segment
+    // that survives is the one actually meeting the border.
+    while pts.len() > 2 && source.contains(pts[1]) {
+        pts.remove(0);
+    }
+    while pts.len() > 2 && target.contains(pts[pts.len() - 2]) {
+        pts.pop();
+    }
+
+    // Leaving the source: snap onto whichever border the route heads away from.
+    let (a, b) = (pts[0], pts[1]);
+    if (a.x - b.x).abs() < EPS {
+        pts[0].y = if b.y > source.center().y {
+            source.bottom()
+        } else {
+            source.top()
+        };
+        pts[0].x = pts[0].x.clamp(source.left(), source.right());
+    } else {
+        pts[0].x = if b.x > source.center().x {
+            source.right()
+        } else {
+            source.left()
+        };
+        pts[0].y = pts[0].y.clamp(source.top(), source.bottom());
+    }
+
+    // Arriving at the target: same, from the other side.
+    let n = pts.len();
+    let (p, q) = (pts[n - 2], pts[n - 1]);
+    if (p.x - q.x).abs() < EPS {
+        pts[n - 1].y = if p.y < target.center().y {
+            target.top()
+        } else {
+            target.bottom()
+        };
+        pts[n - 1].x = pts[n - 1].x.clamp(target.left(), target.right());
+    } else {
+        pts[n - 1].x = if p.x < target.center().x {
+            target.left()
+        } else {
+            target.right()
+        };
+        pts[n - 1].y = pts[n - 1].y.clamp(target.top(), target.bottom());
+    }
+
+    pts
+}
+
+/// Width the renderer will give a label box, in unzoomed units.
+///
+/// Mirrors what `measure_text` plus the drawing padding produce, so callers can
+/// reserve space for a label before it is drawn.
+fn label_box_width(text: &str, font_size: f32) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let widest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+    widest as f32 * font_size * 0.55 + 14.0
+}
+
+/// A clean rectangular loop out of the right-hand side of a box and back.
+///
+/// dagre routes self-edges with a geometry of its own that does not survive
+/// being rewritten into right angles — the result was two stray parallel lines
+/// and an arrowhead across the border. Synthesising the loop keeps it readable
+/// and predictable. `reach` is how far right the loop extends: the caller sizes
+/// it to enclose the label, otherwise a multi-line label spills back over the
+/// state box.
+fn self_loop_route(rect: egui::Rect, reach: f32) -> Vec<egui::Pos2> {
+    let upper = rect.center().y - rect.height() * 0.28;
+    let lower = rect.center().y + rect.height() * 0.28;
+
+    vec![
+        egui::pos2(rect.right(), upper),
+        egui::pos2(reach, upper),
+        egui::pos2(reach, lower),
+        egui::pos2(rect.right(), lower),
+    ]
+}
+
+/// Rewrites a polyline so every segment is axis-aligned.
+///
+/// dagre returns diagonals between ranks. Each is replaced by a three-segment
+/// "Z": travel along the rank direction to the crossover point, cross, then
+/// continue. A Z rather than an L keeps the flow direction dominant.
+///
+/// `lane` staggers the crossover so edges spanning the same pair of ranks don't
+/// all run along the same line. Without it every crossover sat at the exact
+/// midpoint and parallel edges overlapped.
+fn orthogonalise(points: &[egui::Pos2], direction: LayoutDirection, lane: usize) -> Vec<egui::Pos2> {
+    const EPS: f32 = 0.5;
+
+    if points.len() < 2 {
+        return points.to_vec();
+    }
+
+    // Fractions either side of the midpoint, cycled per edge.
+    const CROSSOVERS: [f32; 5] = [0.50, 0.62, 0.38, 0.72, 0.28];
+    let t = CROSSOVERS[lane % CROSSOVERS.len()];
+
+    let mut out: Vec<egui::Pos2> = Vec::with_capacity(points.len() * 2);
+    out.push(points[0]);
+
+    for pair in points.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let dx = (b.x - a.x).abs();
+        let dy = (b.y - a.y).abs();
+
+        // Already axis-aligned.
+        if dx <= EPS || dy <= EPS {
+            out.push(b);
+            continue;
+        }
+
+        // A shallow diagonal used to survive: the two points inserted below
+        // landed within EPS of the originals and were deduplicated away, leaving
+        // the diagonal in place and the arrowhead pointing at an angle. Turning
+        // it into a single right-angle corner avoids that entirely.
+        let shallow = 2.0;
+        if dy < shallow {
+            out.push(egui::pos2(b.x, a.y));
+            out.push(b);
+            continue;
+        }
+        if dx < shallow {
+            out.push(egui::pos2(a.x, b.y));
+            out.push(b);
+            continue;
+        }
+
+        match direction {
+            LayoutDirection::TB => {
+                let cross_y = a.y + (b.y - a.y) * t;
+                out.push(egui::pos2(a.x, cross_y));
+                out.push(egui::pos2(b.x, cross_y));
+            }
+            LayoutDirection::LR => {
+                let cross_x = a.x + (b.x - a.x) * t;
+                out.push(egui::pos2(cross_x, a.y));
+                out.push(egui::pos2(cross_x, b.y));
+            }
+        }
+        out.push(b);
+    }
+
+    out.dedup_by(|a, b| (a.x - b.x).abs() < EPS && (a.y - b.y).abs() < EPS);
+
+    // Drop points sitting in the middle of a straight run.
+    let mut simplified: Vec<egui::Pos2> = Vec::with_capacity(out.len());
+    for (i, p) in out.iter().copied().enumerate() {
+        if i == 0 || i + 1 == out.len() {
+            simplified.push(p);
+            continue;
+        }
+        let prev = *simplified.last().unwrap();
+        let next = out[i + 1];
+        let straight_x = (prev.x - p.x).abs() < EPS && (p.x - next.x).abs() < EPS;
+        let straight_y = (prev.y - p.y).abs() < EPS && (p.y - next.y).abs() < EPS;
+        if !(straight_x || straight_y) {
+            simplified.push(p);
+        }
+    }
+
+    simplified
+}
+
 fn estimate_state_size(state: &fsm::State) -> egui::Vec2 {
-    let mut action_lines = 0;
-    let mut max_action_len = 0;
-    
+    let font_size = 10.0_f32;
+    let char_width = font_size * 0.55;
+    let line_height = font_size * 1.3;
+    let padding = 15.0_f32;
+
+    let mut action_lines: Vec<String> = Vec::new();
     for entry in &state.entry_actions {
-        action_lines += 1;
-        max_action_len = max_action_len.max(entry.name.len() + 7); // "entry/ "
+        action_lines.push(format!("entry/ {}", entry.name));
     }
     for exit in &state.exit_actions {
-        action_lines += 1;
-        max_action_len = max_action_len.max(exit.name.len() + 6); // "exit/ "
+        action_lines.push(format!("exit/ {}", exit.name));
     }
-    
-    // Add internal transitions
-    action_lines += state.internal_transitions.len();
-    for internal in &state.internal_transitions {
-        let line_len = internal.label().len();
-        max_action_len = max_action_len.max(line_len);
-    }
-    
-    let name_len = state.name.len();
-    let max_chars = name_len.max(max_action_len);
-    
-    // Estimate width: chars * approximate char width + padding
-    let width = (max_chars as f32 * 8.0).max(100.0) + 30.0;
-    
-    // Estimate height: header + separator + action lines + padding
-    let height = 30.0 + (action_lines.max(1) as f32 * 16.0) + 20.0;
-    
-    egui::vec2(width, height)
+
+    let name_width = state.name.chars().count() as f32 * 9.0;
+    let action_width = action_lines
+        .iter()
+        .map(|line| line.chars().count() as f32 * char_width)
+        .fold(0.0_f32, f32::max);
+    let width = name_width.max(action_width).max(80.0) + padding * 2.0;
+
+    let header_height = 22.0_f32;
+    let actions_height = if action_lines.is_empty() {
+        20.0
+    } else {
+        (action_lines.len() as f32 * line_height) + padding
+    };
+
+    egui::vec2(width, header_height + actions_height)
 }
 
 
@@ -2028,31 +2423,12 @@ fn draw_state(
         action_lines.push(format!("exit/ {}", exit.name));
     }
     
-    // Dynamic sizing based on content
     let font_size = 10.0 * zoom;
-    let char_width = font_size * 0.55;
-    let line_height = font_size * 1.3;
-    
-    // Width based on name or actions
-    let name_width = state.name.len() as f32 * 9.0 * zoom;
-    let action_width = action_lines.iter()
-        .map(|line| line.len() as f32 * char_width)
-        .max_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap_or(0.0);
-    
-    let padding = 15.0 * zoom;
-    let width = name_width.max(action_width).max(80.0 * zoom) + padding * 2.0;
-    
-    // Height: header + actions
     let header_height = 22.0 * zoom;
-    let actions_height = if action_lines.is_empty() {
-        20.0 * zoom
-    } else {
-        (action_lines.len() as f32 * line_height) + padding
-    };
-    let total_height = header_height + actions_height;
-    
-    let rect = egui::Rect::from_center_size(pos, egui::vec2(width, total_height));
+
+    // Same measurement the layout gave dagre, scaled. Keeping these in sync is
+    // what makes edges meet the border instead of stopping short of it.
+    let rect = egui::Rect::from_center_size(pos, estimate_state_size(state) * zoom);
     
     // Colors
     let fill_color = match state.state_type {
@@ -2089,7 +2465,7 @@ fn draw_state(
     // Draw header compartment (name area)
     let header_rect = egui::Rect::from_min_size(
         rect.min,
-        egui::vec2(width, header_height),
+        egui::vec2(rect.width(), header_height),
     );
     
     // Header with rounded top corners only
@@ -2125,7 +2501,7 @@ fn draw_state(
     
     // Entry/exit actions in body
     if !action_lines.is_empty() {
-        let body_center_y = rect.top() + header_height + actions_height / 2.0;
+        let body_center_y = rect.top() + header_height + (rect.height() - header_height) / 2.0;
         let actions = action_lines.join("\n");
         painter.text(
             egui::pos2(rect.center().x, body_center_y),
