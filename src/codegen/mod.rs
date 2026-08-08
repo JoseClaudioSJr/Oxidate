@@ -17,7 +17,10 @@
 //! - Issues: https://github.com/JoseClaudioSJr/Oxidate/issues
 //! - Discussions: https://github.com/JoseClaudioSJr/Oxidate/discussions
 
-use crate::fsm::FsmDefinition;
+use crate::fsm::{FsmDefinition, Transition};
+
+#[cfg(test)]
+mod tests;
 
 /// Code generation target
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,17 +64,133 @@ impl Default for CodegenTarget {
     }
 }
 
-/// Generate Rust code from an FSM definition
-pub fn generate_rust_code(fsm: &FsmDefinition) -> String {
+/// Errors that prevented code generation.
+pub type CodegenErrors = Vec<String>;
+
+/// Generate Rust code from an FSM definition.
+///
+/// The FSM is validated first: generating from a machine with, say, no initial
+/// state used to emit a reference to a non-existent enum variant, so a broken
+/// definition surfaced as a confusing rustc error in the user's crate instead
+/// of a clear message here.
+pub fn generate_rust_code(fsm: &FsmDefinition) -> Result<String, CodegenErrors> {
     generate_rust_code_with_target(fsm, CodegenTarget::Standard)
 }
 
 /// Generate Rust code with specific target
-pub fn generate_rust_code_with_target(fsm: &FsmDefinition, target: CodegenTarget) -> String {
-    match target {
+pub fn generate_rust_code_with_target(
+    fsm: &FsmDefinition,
+    target: CodegenTarget,
+) -> Result<String, CodegenErrors> {
+    validate_for_codegen(fsm)?;
+
+    Ok(match target {
         CodegenTarget::Standard => generate_standard_code(fsm),
         CodegenTarget::Embassy => generate_premium_stub(fsm, "Embassy"),
         CodegenTarget::Rtic => generate_premium_stub(fsm, "RTIC"),
+    })
+}
+
+/// Structural validation plus the naming checks that only the generator can do.
+///
+/// `FsmDefinition::validate` covers the graph itself (missing initial state,
+/// dangling transition endpoints). What it cannot know is that the generator
+/// rewrites names into Rust identifiers, and that rewrite is not injective:
+/// `idle_state` and `IdleState` both become the variant `IdleState`, which
+/// yields an enum that does not compile.
+fn validate_for_codegen(fsm: &FsmDefinition) -> Result<(), CodegenErrors> {
+    let mut errors = fsm.validate().err().unwrap_or_default();
+
+    collect_collisions(
+        fsm.states.iter().map(|s| s.name.as_str()),
+        to_pascal_case,
+        "states",
+        "enum variant",
+        &mut errors,
+    );
+
+    let mut event_names: Vec<&str> = fsm
+        .transitions
+        .iter()
+        .chain(fsm.states.iter().flat_map(|s| s.internal_transitions.iter()))
+        .filter_map(|t| t.event.as_ref().map(|e| e.name.as_str()))
+        .collect();
+    event_names.sort_unstable();
+    event_names.dedup();
+    collect_collisions(
+        event_names.into_iter(),
+        to_pascal_case,
+        "events",
+        "enum variant",
+        &mut errors,
+    );
+
+    let mut action_names: Vec<&str> = fsm
+        .states
+        .iter()
+        .flat_map(|s| s.entry_actions.iter().chain(s.exit_actions.iter()))
+        .map(|a| a.name.as_str())
+        .chain(
+            fsm.transitions
+                .iter()
+                .chain(fsm.states.iter().flat_map(|s| s.internal_transitions.iter()))
+                .filter_map(|t| t.action.as_ref().map(|a| a.name.as_str())),
+        )
+        .collect();
+    action_names.sort_unstable();
+    action_names.dedup();
+    collect_collisions(
+        action_names.into_iter(),
+        to_snake_case,
+        "actions",
+        "trait method",
+        &mut errors,
+    );
+
+    let mut guard_exprs: Vec<&str> = fsm
+        .transitions
+        .iter()
+        .chain(fsm.states.iter().flat_map(|s| s.internal_transitions.iter()))
+        .filter_map(|t| t.guard.as_ref().map(|g| g.expression.as_str()))
+        .collect();
+    guard_exprs.sort_unstable();
+    guard_exprs.dedup();
+    collect_collisions(
+        guard_exprs.into_iter(),
+        to_guard_ident,
+        "guards",
+        "trait method",
+        &mut errors,
+    );
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+/// Reports every pair of distinct names that `convert` maps onto one identifier.
+fn collect_collisions<'a, I, F>(
+    names: I,
+    convert: F,
+    kind: &str,
+    produces: &str,
+    errors: &mut CodegenErrors,
+) where
+    I: Iterator<Item = &'a str>,
+    F: Fn(&str) -> String,
+{
+    let mut seen: Vec<(String, &str)> = Vec::new();
+    for name in names {
+        let generated = convert(name);
+        if let Some((_, first)) = seen.iter().find(|(g, _)| *g == generated) {
+            errors.push(format!(
+                "{kind} '{first}' and '{name}' both generate the {produces} '{generated}'"
+            ));
+        } else {
+            seen.push((generated, name));
+        }
     }
 }
 
@@ -149,6 +268,11 @@ fn generate_state_enum(fsm: &FsmDefinition) -> String {
         }
         code.push_str(&format!("    {},\n", to_pascal_case(&state.name)));
     }
+
+    if has_final_state(fsm) {
+        code.push_str("    /// UML final pseudo-state: the machine has terminated.\n");
+        code.push_str(&format!("    {},\n", final_variant_name(fsm)));
+    }
     
     code.push_str("}\n");
     code
@@ -157,17 +281,25 @@ fn generate_state_enum(fsm: &FsmDefinition) -> String {
 fn generate_event_enum(fsm: &FsmDefinition) -> String {
     let mut code = String::new();
     
-    // Collect unique events
+    // Collect unique events from external transitions...
     let mut events: Vec<String> = fsm.transitions
         .iter()
         .filter_map(|t| t.event.as_ref().map(|e| e.name.clone()))
         .collect();
+    // ...and from internal transitions declared inside state bodies.
+    events.extend(
+        fsm.states
+            .iter()
+            .flat_map(|s| s.internal_transitions.iter())
+            .filter_map(|t| t.event.as_ref().map(|e| e.name.clone())),
+    );
     events.sort();
     events.dedup();
-    
-    if events.is_empty() {
-        return String::new();
-    }
+
+    // Even with no events the enum has to exist: `process()` takes it as a
+    // parameter, so returning early left a reference to an undefined type.
+    // An empty enum is uninhabited, which correctly says the machine can
+    // never be driven by an event.
     
     code.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n");
     code.push_str(&format!("pub enum {}Event {{\n", fsm.name));
@@ -235,22 +367,99 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
     
     code.push_str(&format!("    pub fn process(&mut self, event: {}Event) {{\n", fsm.name));
     code.push_str("        match (self.state, event) {\n");
-    
-    for transition in &fsm.transitions {
+
+    // Internal transitions are emitted first: per UML semantics they take
+    // precedence over external transitions on the same (state, event) pair.
+    // They run their action without leaving the state, so no exit/entry
+    // actions and no state change.
+    for state in &fsm.states {
+        for internal in &state.internal_transitions {
+            let Some(ref event) = internal.event else {
+                continue;
+            };
+            let source = to_pascal_case(&state.name);
+            let event_name = to_pascal_case(&event.name);
+
+            if let Some(ref guard) = internal.guard {
+                code.push_str(&format!(
+                    "            ({}State::{}, {}Event::{}) if self.context.{}() => {{\n",
+                    fsm.name, source, fsm.name, event_name, to_guard_ident(&guard.expression)
+                ));
+            } else {
+                code.push_str(&format!(
+                    "            ({}State::{}, {}Event::{}) => {{\n",
+                    fsm.name, source, fsm.name, event_name
+                ));
+            }
+
+            if let Some(ref action) = internal.action {
+                code.push_str(&format!(
+                    "                self.context.{}();\n",
+                    to_snake_case(&action.name)
+                ));
+            }
+
+            code.push_str("                // Internal transition: state unchanged\n");
+            code.push_str("            }\n");
+        }
+    }
+
+    // A (state, event) pair already handled by an unguarded internal
+    // transition is unreachable below, so skip it to avoid emitting code
+    // that trips `unreachable_patterns` in the user's crate.
+    let shadowed: Vec<(String, String)> = fsm
+        .states
+        .iter()
+        .flat_map(|s| s.internal_transitions.iter())
+        .filter(|t| t.guard.is_none())
+        .filter_map(|t| {
+            t.event
+                .as_ref()
+                .map(|e| (t.source.clone(), e.name.clone()))
+        })
+        .collect();
+
+    // Guarded transitions must be emitted before unguarded ones. A match arm
+    // without a guard is a catch-all for its (state, event) pair, so if the
+    // DSL happened to list the unguarded transition first, every guarded
+    // transition below it became unreachable and its guard silently never ran.
+    // Arms for different (state, event) pairs are disjoint, so ordering all
+    // guarded arms first is enough — no per-pair grouping needed.
+    let ordered: Vec<&Transition> = fsm
+        .transitions
+        .iter()
+        .filter(|t| t.guard.is_some())
+        .chain(fsm.transitions.iter().filter(|t| t.guard.is_none()))
+        .collect();
+
+    for transition in ordered {
         if transition.source == "[*]" {
             continue; // Skip initial transitions
+        }
+
+        if let Some(ref event) = transition.event {
+            if shadowed
+                .iter()
+                .any(|(s, e)| *s == transition.source && *e == event.name)
+            {
+                continue;
+            }
         }
         
         if let Some(ref event) = transition.event {
             let source = to_pascal_case(&transition.source);
-            let target = to_pascal_case(&transition.target);
+            let target = if transition.target == "[*]" {
+                final_variant_name(fsm)
+            } else {
+                to_pascal_case(&transition.target)
+            };
             let event_name = to_pascal_case(&event.name);
             
             // Check for guard
             if let Some(ref guard) = transition.guard {
                 code.push_str(&format!(
-                    "            ({}State::{}, {}Event::{}) if self.context.{} => {{\n",
-                    fsm.name, source, fsm.name, event_name, to_snake_case(&guard.expression)
+                    "            ({}State::{}, {}Event::{}) if self.context.{}() => {{\n",
+                    fsm.name, source, fsm.name, event_name, to_guard_ident(&guard.expression)
                 ));
             } else {
                 code.push_str(&format!(
@@ -297,8 +506,15 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
         }
     }
     
-    // Default case - no transition
-    code.push_str("            _ => {} // No transition\n");
+    // Default case - no transition.
+    //
+    // Only emitted when something is actually left uncovered. When every
+    // (state, event) pair already has an unguarded arm, a trailing wildcard is
+    // dead code and makes the generated crate warn on `unreachable_patterns` —
+    // which breaks anyone building with `-D warnings`.
+    if !is_match_exhaustive(fsm) {
+        code.push_str("            _ => {} // No transition\n");
+    }
     code.push_str("        }\n");
     code.push_str("    }\n");
     
@@ -318,6 +534,14 @@ fn generate_action_trait(fsm: &FsmDefinition) -> String {
         }
         for action in &state.exit_actions {
             actions.push(action.name.clone());
+        }
+        for internal in &state.internal_transitions {
+            if let Some(ref action) = internal.action {
+                actions.push(action.name.clone());
+            }
+            if let Some(ref guard) = internal.guard {
+                guards.push(guard.expression.clone());
+            }
         }
     }
     
@@ -342,7 +566,8 @@ fn generate_action_trait(fsm: &FsmDefinition) -> String {
     }
     
     for guard in &guards {
-        code.push_str(&format!("    fn {}(&self) -> bool;\n", to_snake_case(guard)));
+        code.push_str(&format!("    /// Guard: `{}`\n", guard));
+        code.push_str(&format!("    fn {}(&self) -> bool;\n", to_guard_ident(guard)));
     }
     
     code.push_str("}\n");
@@ -362,8 +587,151 @@ fn to_pascal_case(s: &str) -> String {
         .collect()
 }
 
-fn to_snake_case(s: &str) -> String {
-    let mut result = String::new();
+/// True when every (state, event) pair is covered by an *unguarded* arm.
+///
+/// Guarded arms don't count: a guard can evaluate false, so control falls
+/// through and the pair is still reachable by the wildcard.
+fn is_match_exhaustive(fsm: &FsmDefinition) -> bool {
+    let mut state_variants: Vec<String> =
+        fsm.states.iter().map(|s| to_pascal_case(&s.name)).collect();
+    if has_final_state(fsm) {
+        // Nothing ever transitions *out* of the final state, so its presence
+        // alone means the match cannot be exhaustive.
+        state_variants.push(final_variant_name(fsm));
+    }
+
+    let mut event_variants: Vec<String> = fsm
+        .transitions
+        .iter()
+        .chain(fsm.states.iter().flat_map(|s| s.internal_transitions.iter()))
+        .filter_map(|t| t.event.as_ref().map(|e| to_pascal_case(&e.name)))
+        .collect();
+    event_variants.sort();
+    event_variants.dedup();
+
+    // An empty match is only valid on an uninhabited type; keep the wildcard
+    // rather than reason about that corner.
+    if state_variants.is_empty() || event_variants.is_empty() {
+        return false;
+    }
+
+    let mut covered: Vec<(String, String)> = fsm
+        .transitions
+        .iter()
+        .filter(|t| t.guard.is_none() && t.source != "[*]")
+        .filter_map(|t| {
+            t.event
+                .as_ref()
+                .map(|e| (to_pascal_case(&t.source), to_pascal_case(&e.name)))
+        })
+        .chain(
+            fsm.states
+                .iter()
+                .flat_map(|s| s.internal_transitions.iter())
+                .filter(|t| t.guard.is_none())
+                .filter_map(|t| {
+                    t.event
+                        .as_ref()
+                        .map(|e| (to_pascal_case(&t.source), to_pascal_case(&e.name)))
+                }),
+        )
+        .collect();
+    covered.sort();
+    covered.dedup();
+
+    covered.len() == state_variants.len() * event_variants.len()
+}
+
+/// True when some transition targets the UML final pseudo-state `[*]`.
+///
+/// The variant is only emitted when it is actually reachable, so machines that
+/// never terminate don't carry a dead variant.
+fn has_final_state(fsm: &FsmDefinition) -> bool {
+    fsm.transitions.iter().any(|t| t.target == "[*]")
+}
+
+/// Name of the enum variant standing in for `[*]` as a transition target.
+///
+/// A user is free to declare a state literally called `Final`, so the name is
+/// widened until it stops colliding rather than silently producing a duplicate
+/// variant.
+fn final_variant_name(fsm: &FsmDefinition) -> String {
+    let mut name = "Final".to_string();
+    while fsm
+        .states
+        .iter()
+        .any(|s| to_pascal_case(&s.name) == name)
+    {
+        name.push('_');
+    }
+    name
+}
+
+/// Turns a guard expression into a valid Rust identifier for the actions trait.
+///
+/// A guard is written as a free-form expression in the DSL (`[attempts > 3]`,
+/// `[response.is_success()]`), but it is generated as a method on the actions
+/// trait, so it has to become a legal identifier. Operators are spelled out
+/// rather than dropped, so `[attempts > 3]` and `[attempts < 3]` don't collide.
+fn to_guard_ident(expr: &str) -> String {
+    // Longest first: `>=` must not be matched as `>`.
+    const OPERATORS: &[(&str, &str)] = &[
+        (">=", " ge "),
+        ("<=", " le "),
+        ("==", " eq "),
+        ("!=", " ne "),
+        ("&&", " and "),
+        ("||", " or "),
+        (">", " gt "),
+        ("<", " lt "),
+        ("!", " not "),
+    ];
+
+    let mut spelled = expr.to_string();
+    for (symbol, word) in OPERATORS {
+        spelled = spelled.replace(symbol, word);
+    }
+
+    // Everything that is not alphanumeric becomes a separator; `.` and `()`
+    // from method-call syntax fall into this bucket too.
+    let mut ident = String::new();
+    let mut pending_underscore = false;
+    for c in spelled.chars() {
+        if c.is_alphanumeric() || c == '_' {
+            if pending_underscore && !ident.is_empty() {
+                ident.push('_');
+            }
+            pending_underscore = false;
+            ident.extend(c.to_lowercase());
+        } else {
+            pending_underscore = true;
+        }
+    }
+
+    if ident.is_empty() {
+        return "guard".to_string();
+    }
+
+    // An identifier may not start with a digit.
+    if ident.starts_with(|c: char| c.is_ascii_digit()) {
+        ident.insert_str(0, "guard_");
+    }
+
+    // Avoid colliding with a Rust keyword.
+    const KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+        "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
+        "where", "while", "async", "await", "dyn",
+    ];
+    if KEYWORDS.contains(&ident.as_str()) {
+        ident.push('_');
+    }
+
+    ident
+}
+
+fn to_snake_case(s: &str) -> String {    let mut result = String::new();
     for (i, c) in s.chars().enumerate() {
         if c.is_uppercase() && i > 0 {
             result.push('_');
