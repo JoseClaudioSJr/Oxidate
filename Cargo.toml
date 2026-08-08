@@ -26,7 +26,7 @@ include = [
 
 [features]
 default = ["gui"]
-gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]  # GUI editor (default)
+gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd", "dep:dagre"]  # GUI editor (default)
 
 # Premium features (available separately)
 # embassy = []  # Embassy async code generation - see docs/PREMIUM_FEATURES.md
@@ -35,6 +35,11 @@ gui = ["dep:eframe", "dep:egui", "dep:egui_extras", "dep:rfd"]  # GUI editor (de
 [dependencies]
 # GUI
 eframe = { version = "0.29", optional = true }
+# Graph layout for the GUI. A pure-Rust port of dagre.js, replacing the previous
+# setup that shelled out to Node. Optional and tied to `gui` on purpose: it needs
+# edition 2024 (rustc 1.85+), and gating it here keeps the library usable as a
+# code generator on the MSRV declared above.
+dagre = { version = "0.1", optional = true }
 egui = { version = "0.29", optional = true }
 egui_extras = { version = "0.29", features = ["all_loaders"], optional = true }
 
@@ -50,8 +55,7 @@ pest_derive = ">=2.7, <2.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Layout engine
-# We use JS Dagre via a Node.js subprocess (see tools/dagre-svg-demo/src/layout_json.mjs)
+# Layout engine: see the `dagre` dependency above (pure Rust, no subprocess).
 
 # Code generation
 quote = "1.0"
@@ -69,20 +73,16 @@ rfd = { version = "0.14", optional = true }
 name = "Oxidate"
 identifier = "com.joseclaudio.oxidate"
 icon = ["assets/oxidate.icns"]
-# Bundle the JS layout backend (including node_modules if present) so the app can run from inside the .app.
-resources = ["tools/dagre-svg-demo"]
+# Nothing extra to bundle: layout is compiled into the binary.
 
 [package.metadata.deb]
 section = "utils"
 priority = "optional"
-# We call out Node.js explicitly because the layout engine uses Dagre via a Node subprocess.
-depends = ["nodejs"]
 assets = [
 	["target/release/oxidate", "usr/bin/oxidate", "755"],
 	["target/release/oxidate-cli", "usr/bin/oxidate-cli", "755"],
 	["assets/linux/oxidate.desktop", "usr/share/applications/oxidate.desktop", "644"],
 	["assets/oxidate.png", "usr/share/icons/hicolor/512x512/apps/oxidate.png", "644"],
-	["tools/dagre-svg-demo/**", "usr/share/oxidate/tools/dagre-svg-demo/", "644"],
 ]
 
 [package.metadata.docs.rs]

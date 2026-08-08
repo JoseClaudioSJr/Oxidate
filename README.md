@@ -44,8 +44,8 @@ For embedded development, Oxidate Pro is available separately. Contact to purcha
 
 ### Prerequisites
 
-- **Rust** 1.70+ (`rustup install stable`)
-- **Node.js** 18+ (for Dagre layout engine)
+- **Rust** 1.70+ to use the crate as a library (`rustup install stable`)
+- **Rust** 1.85+ to build the GUI, which depends on the `dagre` layout crate
 
 ### Installation
 
@@ -60,9 +60,6 @@ cargo install oxidate-fsm --no-default-features
 # Clone the repository
 git clone https://github.com/JoseClaudioSJr/Oxidate.git
 cd oxidate
-
-# Install JS layout dependencies
-cd tools/dagre-svg-demo && npm install && cd ../..
 
 # Run the GUI
 cargo run --release
@@ -186,11 +183,43 @@ StateX --> <<CheckCondition>> : evaluate
 
 ### Simulation Mode
 
-1. Click **Debug** to enter simulation mode
-2. Current state highlights in green
-3. Available transitions show as buttons
-4. Click an event to fire it and watch the transition animate
-5. Use **Auto-run** for automatic event cycling
+Tick **Debug sim** in the diagram toolbar to reveal the simulation controls.
+
+**Getting started**
+
+1. **Reset** puts the machine in its initial state, which highlights in the diagram.
+2. Type an event name into the **Event** field and press **Post** to queue it.
+3. **Step** consumes one queued event and performs the transition.
+4. **Run** consumes the queue continuously, paced by the **speed** slider.
+
+Event names are the ones on your transitions — for `examples/door_lock.fsm`
+those are `valid_key`, `door_opened`, `door_closed`, `lock_cmd` and so on.
+
+**Driving it automatically**
+
+Tick **Auto** and the simulator posts events for you every **period** seconds.
+The **events** field takes a comma-separated sequence, cycled one per tick:
+
+```
+valid_key, door_opened, door_closed, lock_cmd
+```
+
+With **Run** also enabled, the machine cycles on its own — no clicking.
+
+A single name is valid too, and repeats forever. That is enough for machines
+where every transition fires on the same event, such as `TimerExpired` in
+`examples/traffic_light.fsm`:
+
+```
+Debug sim → Reset → events: TimerExpired → Auto → Run
+```
+
+Red → Green → Yellow → Red, indefinitely. For a machine with distinct events
+per transition, a single name stalls after the first transition, since the
+repeated event matches nothing from the new state — give it a sequence instead.
+
+Every transition is appended to the log below the controls, including internal
+transitions, which are marked as such. **Clear log** empties it.
 
 ---
 
@@ -305,7 +334,6 @@ oxidate/
 │   └── codegen/         # Code generators
 │       └── mod.rs
 ├── tools/
-│   ├── dagre-svg-demo/  # Node.js Dagre layout backend
 │   ├── gen_icon.py      # Icon generator
 │   └── package/         # Packaging scripts
 ├── assets/
@@ -348,7 +376,7 @@ Sim --> V
 The visualization uses a strict separation:
 
 1. **FSM → Graph** — Convert states/transitions to graph nodes/edges
-2. **Graph → Layout Engine** — Dagre (via Node.js subprocess) computes positions
+2. **Graph → Layout Engine** — the `dagre` crate (pure Rust) computes positions
 3. **Layout → Renderer** — egui draws nodes and pre-computed edge routes
 
 This ensures consistent, professional layouts without heuristic edge routing.
@@ -359,8 +387,6 @@ This ensures consistent, professional layouts without heuristic edge routing.
 
 | Variable | Description |
 |----------|-------------|
-| `OXIDATE_DAGRE_DIR` | Override path to `tools/dagre-svg-demo` |
-| `OXIDATE_NODE` | Override path to Node.js binary |
 
 ---
 

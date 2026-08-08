@@ -232,7 +232,11 @@ impl eframe::App for OxidateApp {
 
 ### Design Decision: External Layout
 
-We use [Dagre](https://github.com/dagrejs/dagre) via a Node.js subprocess rather than a pure-Rust layout library because:
+We use the [`dagre`](https://crates.io/crates/dagre) crate, a pure-Rust port of
+[dagre.js](https://github.com/dagrejs/dagre), cross-validated against it on 20
+reference graphs. Earlier versions shelled out to Node.js to run dagre.js itself;
+that required Node at runtime and an `npm install` step, and meant `cargo install`
+did not produce a working GUI. Historical rationale for the old approach:
 
 1. **Maturity** — Dagre is battle-tested for DAG layouts
 2. **Quality** — Produces professional-looking hierarchical layouts
@@ -242,7 +246,7 @@ We use [Dagre](https://github.com/dagrejs/dagre) via a Node.js subprocess rather
 
 ```
 ┌───────────────┐     ┌───────────────┐     ┌───────────────┐
-│ FsmDefinition │────▶│   JsLayout    │────▶│  Node.js      │
+│ FsmDefinition │────▶│  dagre::Graph │────▶│  dagre (Rust) │
 │               │     │   Input       │     │  (Dagre)      │
 └───────────────┘     │   (JSON)      │     └───────┬───────┘
                       └───────────────┘             │

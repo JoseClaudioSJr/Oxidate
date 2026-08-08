@@ -109,6 +109,8 @@ pub struct BlinkActiveObject<T: BlinkActions> {
     tick_count: u32,
 }
 
+// Helper methods kept for illustration; not every one is exercised here.
+#[allow(dead_code)]
 impl<T: BlinkActions> BlinkActiveObject<T> {
     pub fn new(context: T) -> Self {
         Self {
@@ -233,6 +235,8 @@ struct TestBlinkActions {
     led_state: Rc<RefCell<bool>>,
 }
 
+// Helper methods kept for illustration; not every one is exercised here.
+#[allow(dead_code)]
 impl TestBlinkActions {
     fn new() -> Self {
         Self {
@@ -323,7 +327,6 @@ mod tests {
     
     #[test]
     fn test_toggle_cycle() {
-        let channel: Channel<BlinkEvent, EVENT_QUEUE_SIZE> = Channel::new();
         let actions = TestBlinkActions::new();
         let mut ao = BlinkActiveObject::new(actions.clone());
         

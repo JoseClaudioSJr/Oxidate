@@ -90,8 +90,6 @@ impl<A: TrafficLightActions> TrafficLightFsm<A> {
                 self.actions.on_enter_red();
                 true
             }
-            // No transition for this state/event combination
-            _ => false,
         }
     }
 }

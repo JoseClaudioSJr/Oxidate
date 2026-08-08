@@ -1,9 +1,6 @@
 //! Oxidate CLI - Command Line Interface for FSM parsing
 
-mod fsm;
-mod parser;
-
-use parser::parse_fsm;
+use oxidate_fsm::parser::parse_fsm;
 use std::env;
 use std::fs;
 

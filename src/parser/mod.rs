@@ -89,7 +89,7 @@ fn parse_fsm_item(pair: pest::iterators::Pair<Rule>, fsm: &mut FsmDefinition) ->
 
     match inner.as_rule() {
         Rule::initial_state => {
-            let mut inner_iter = inner.into_inner();
+            let inner_iter = inner.into_inner();
             // Skip arrow, get identifier
             let state_name = inner_iter.last().unwrap().as_str();
             fsm.initial_state = Some(state_name.to_string());

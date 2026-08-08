@@ -23,3 +23,4 @@ tools/dagre-svg-demo/node_modules/
 
 # Local Cargo config (machine-specific target overrides)
 /.cargo/config.toml
+*.patch

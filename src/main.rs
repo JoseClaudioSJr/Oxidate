@@ -3,18 +3,11 @@
 
 use eframe::egui;
 use std::collections::HashMap;
-use std::io::Write;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-mod fsm;
-mod parser;
-mod codegen;
-
-use fsm::{FsmDefinition, StateType};
-use parser::parse_fsm;
-use codegen::{generate_rust_code_with_target, CodegenTarget};
+use oxidate_fsm::fsm::{self, FsmDefinition, StateType};
+use oxidate_fsm::parser::parse_fsm;
+use oxidate_fsm::codegen::{generate_rust_code_with_target, CodegenTarget};
 
 /// Renders validation errors as a Rust comment block, so the code panel shows
 /// what is wrong instead of silently keeping the previous FSM's output.
@@ -26,7 +19,6 @@ fn format_codegen_errors(fsm_name: &str, errors: &[String]) -> String {
     out
 }
 
-use serde::{Deserialize, Serialize};
 
 fn oxidate_icon() -> egui::IconData {
     // Simple generated icon (64x64): dark background + orange "oxidation" ring.
@@ -86,105 +78,7 @@ fn oxidate_icon() -> egui::IconData {
     egui::IconData { rgba, width: w, height: h }
 }
 
-fn dagre_demo_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("OXIDATE_DAGRE_DIR") {
-        let p = PathBuf::from(dir);
-        if p.join("src/layout_json.mjs").exists() {
-            return p;
-        }
-    }
 
-    // When bundled on macOS, resources live at:
-    //   Oxidate.app/Contents/Resources/
-    // and our demo is copied to:
-    //   .../Resources/tools/dagre-svg-demo/
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            // macOS bundle: Contents/MacOS/<bin>
-            if let Some(contents_dir) = exe_dir.parent() {
-                let resources = contents_dir.join("Resources").join("tools/dagre-svg-demo");
-                if resources.join("src/layout_json.mjs").exists() {
-                    return resources;
-                }
-            }
-
-            // Generic "resources" layout (zip/AppDir): <exe_dir>/resources/tools/dagre-svg-demo
-            let resources = exe_dir.join("resources").join("tools/dagre-svg-demo");
-            if resources.join("src/layout_json.mjs").exists() {
-                return resources;
-            }
-
-            // Next to executable: <exe_dir>/tools/dagre-svg-demo
-            let sibling = exe_dir.join("tools/dagre-svg-demo");
-            if sibling.join("src/layout_json.mjs").exists() {
-                return sibling;
-            }
-
-            // AppImage-style: <AppDir>/usr/bin/<bin> → <AppDir>/usr/share/oxidate/tools/dagre-svg-demo
-            if let Some(usr_dir) = exe_dir.parent() {
-                let appimage = usr_dir.join("share/oxidate/tools/dagre-svg-demo");
-                if appimage.join("src/layout_json.mjs").exists() {
-                    return appimage;
-                }
-            }
-        }
-    }
-
-    // Dev fallback
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/dagre-svg-demo")
-}
-
-fn node_binary() -> PathBuf {
-    if let Ok(p) = std::env::var("OXIDATE_NODE") {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            return pb;
-        }
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            // macOS bundle: Contents/MacOS/<bin> → Contents/Resources/node/bin/node
-            if let Some(contents_dir) = exe_dir.parent() {
-                let mac_node = contents_dir.join("Resources/node/bin/node");
-                if mac_node.exists() {
-                    return mac_node;
-                }
-            }
-
-            // Windows zip: <exe_dir>/node/node.exe
-            #[cfg(windows)]
-            {
-                let win_node = exe_dir.join("node/node.exe");
-                if win_node.exists() {
-                    return win_node;
-                }
-                let win_node = exe_dir.join("resources/node/node.exe");
-                if win_node.exists() {
-                    return win_node;
-                }
-            }
-
-            // Linux AppImage / generic: <AppDir>/usr/bin/<bin> → <AppDir>/usr/lib/oxidate/node/bin/node
-            #[cfg(not(windows))]
-            {
-                let unix_node = exe_dir.join("node/bin/node");
-                if unix_node.exists() {
-                    return unix_node;
-                }
-                if let Some(usr_dir) = exe_dir.parent() {
-                    let appimage_node = usr_dir.join("lib/oxidate/node/bin/node");
-                    if appimage_node.exists() {
-                        return appimage_node;
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback to PATH lookup.
-    PathBuf::from("node")
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LayoutDirection {
@@ -308,7 +202,13 @@ struct Simulator {
     event_input: String,
 
     auto_tick: bool,
+    /// Comma-separated event names, cycled one per tick. A single name repeats
+    /// forever, which only drives machines whose transitions all share an event.
     auto_event: String,
+    /// What `suggest_event_sequence` last offered. Lets Reset refresh the
+    /// suggestion when the user has not typed their own sequence.
+    suggested_events: String,
+    auto_cursor: usize,
     auto_period_s: f32,
     auto_accum_s: f32,
 
@@ -318,6 +218,7 @@ struct Simulator {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // deserialisation targets; not every field is read
 struct SimFired {
     transition_index: Option<usize>,
     from: String,
@@ -337,7 +238,12 @@ impl Default for Simulator {
             queued_events: std::collections::VecDeque::new(),
             event_input: String::new(),
             auto_tick: false,
-            auto_event: "timer_expired".to_string(),
+            // Matches examples/traffic_light.fsm, so Auto + Run cycles out of
+            // the box. The previous default, "timer_expired", matched nothing
+            // in any shipped example.
+            auto_event: "TimerExpired".to_string(),
+            suggested_events: "TimerExpired".to_string(),
+            auto_cursor: 0,
             auto_period_s: 1.0,
             auto_accum_s: 0.0,
             last_frame: None,
@@ -483,452 +389,273 @@ impl OxidateApp {
         })
     }
 
-    fn compute_layout_with_dagre(&mut self, ctx: &egui::Context, fsm: &FsmDefinition) -> Result<(), String> {
-        #[derive(Serialize)]
-        struct JsGraphCfg {
-            rankdir: String,
-            nodesep: f32,
-            ranksep: f32,
-            edgesep: f32,
-            marginx: f32,
-            marginy: f32,
-        }
 
-        #[derive(Serialize)]
-        struct JsNodeIn {
-            id: String,
-            width: f32,
-            height: f32,
-        }
-
-        #[derive(Serialize)]
-        struct JsEdgeIn {
-            v: String,
-            w: String,
-            name: Option<String>,
-            #[serde(rename = "labelWidth")]
-            label_width: Option<f32>,
-            #[serde(rename = "labelHeight")]
-            label_height: Option<f32>,
-        }
-
-        #[derive(Serialize)]
-        struct JsLayoutInput {
-            graph: JsGraphCfg,
-            nodes: Vec<JsNodeIn>,
-            edges: Vec<JsEdgeIn>,
-        }
-
-        #[derive(Deserialize)]
-        struct JsPoint {
-            x: f32,
-            y: f32,
-        }
-
-        #[derive(Deserialize)]
-        struct JsNodeOut {
-            x: f32,
-            y: f32,
-            width: f32,
-            height: f32,
-        }
-
-        #[derive(Deserialize)]
-        struct JsGraphOut {
-            width: f32,
-            height: f32,
-        }
-
-        #[derive(Deserialize)]
-        struct JsEdgeOut {
-            v: String,
-            w: String,
-            name: Option<String>,
-            points: Vec<JsPoint>,
-            x: Option<f32>,
-            y: Option<f32>,
-        }
-
-        #[derive(Deserialize)]
-        struct JsLayoutOutput {
-            graph: JsGraphOut,
-            nodes: std::collections::HashMap<String, JsNodeOut>,
-            edges: Vec<JsEdgeOut>,
-        }
-
-        // Graph config to send to JS Dagre.
-        let graph_cfg = JsGraphCfg {
-            rankdir: match self.layout_config.direction {
-                LayoutDirection::TB => "tb".to_string(),
-                LayoutDirection::LR => "lr".to_string(),
-            },
-            nodesep: self.layout_config.nodesep,
-            ranksep: self.layout_config.ranksep,
-            edgesep: self.layout_config.edgesep,
-            marginx: self.layout_config.marginx,
-            marginy: self.layout_config.marginy,
+    /// Walks the machine from its initial state and returns the events needed to
+    /// drive it, as a comma-separated list for the Auto field.
+    ///
+    /// Derived from the FSM rather than hardcoded per example, so a machine the
+    /// user just wrote gets a working sequence too. Prefers transitions it has
+    /// not taken yet, which tends to cover the whole graph before repeating.
+    fn suggest_event_sequence(fsm: &FsmDefinition) -> String {
+        let Some(initial) = fsm.initial_state.clone() else {
+            return String::new();
         };
 
-        // Nodes.
-        let mut nodes_in: Vec<JsNodeIn> = Vec::new();
+        let mut sequence: Vec<String> = Vec::new();
+        let mut taken: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut current = initial.clone();
+
+        // Bounded: a machine with a trap state would otherwise never terminate.
+        for _ in 0..24 {
+            let outgoing: Vec<(usize, &fsm::Transition)> = fsm
+                .transitions
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.source == current && t.event.is_some())
+                .collect();
+
+            if outgoing.is_empty() {
+                break;
+            }
+
+            // An untaken transition first; otherwise fall back to the first one
+            // so the walk keeps moving instead of dead-ending.
+            let (index, transition) = outgoing
+                .iter()
+                .find(|(i, _)| !taken.contains(i))
+                .copied()
+                .unwrap_or(outgoing[0]);
+
+            taken.insert(index);
+            if let Some(event) = &transition.event {
+                sequence.push(event.name.clone());
+            }
+            current = transition.target.clone();
+
+            // Back where we started having used every transition: a full cycle.
+            if current == initial && taken.len() == fsm.transitions.len() {
+                break;
+            }
+        }
+
+        sequence.join(", ")
+    }
+
+
+    /// Pure-Rust layout, via the `dagre` crate — a port of dagre.js.
+    ///
+    /// Replaces the previous path, which spawned Node to run dagre.js and
+    /// parsed its JSON back. Same algorithm, no subprocess, nothing to ship
+    /// alongside the binary.
+    ///
+    /// Edge labels are given a size on the graph, so the layout reserves room
+    /// for them rather than leaving them to land on top of a state box.
+    fn compute_layout_native(&mut self, fsm: &FsmDefinition) {
+        use dagre::graph::{Graph, GraphOptions};
+        use dagre::{layout, EdgeLabel, LayoutOptions, NodeLabel, RankDir};
+
+        let mut g: Graph<NodeLabel, EdgeLabel> = Graph::with_options(GraphOptions {
+            directed: true,
+            multigraph: true,
+            compound: false,
+        });
+
         for state in &fsm.states {
             let size = estimate_state_size(state);
-            nodes_in.push(JsNodeIn {
-                id: state.name.clone(),
-                width: size.x,
-                height: size.y,
-            });
+            let mut node = NodeLabel::default();
+            node.width = size.x as f64;
+            node.height = size.y as f64;
+            g.set_node(state.name.as_str(), Some(node));
         }
 
-        // Pseudo start node.
-        let start_id = "[*]".to_string();
-        let has_start = fsm.transitions.iter().any(|t| t.source == "[*]");
-        if has_start {
-            nodes_in.push(JsNodeIn {
-                id: start_id.clone(),
-                width: 16.0,
-                height: 16.0,
-            });
+        // The initial pseudo-state renders as a small filled circle.
+        let initial = fsm.initial_state.clone();
+        if initial.is_some() {
+            let mut node = NodeLabel::default();
+            node.width = 16.0;
+            node.height = 16.0;
+            g.set_node("[*]", Some(node));
         }
 
-        // Represent every transition as an intermediate node (optionally sized to the label).
-        let mut transition_node_type: std::collections::HashMap<String, TransitionType> = std::collections::HashMap::new();
-        let mut label_node_text: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut edges_in: Vec<JsEdgeIn> = Vec::new();
+        // dagre needs a distinct name per parallel edge; the index doubles as
+        // the way back to the transition once layout has run.
+        let mut edge_keys: Vec<(usize, String, String, String)> = Vec::new();
 
-        for (t_idx, transition) in fsm.transitions.iter().enumerate() {
+        for (index, transition) in fsm.transitions.iter().enumerate() {
             if transition.source == "[*]" {
-                edges_in.push(JsEdgeIn {
-                    v: start_id.clone(),
-                    w: transition.target.clone(),
-                    name: Some(format!("start_{t_idx}")),
-                    label_width: Some(0.0),
-                    label_height: Some(0.0),
-                });
+                continue; // handled as the initial pseudo-edge below
+            }
+            if g.node(transition.source.as_str()).is_none()
+                || g.node(transition.target.as_str()).is_none()
+            {
+                continue; // endpoint not laid out (e.g. a choice point)
+            }
+
+            // Break long labels across lines: the event on one line, the guard
+            // on the next. Narrower labels leave the layout more room to work
+            // with, and dagre needs the size to reserve space for them.
+            let text = format_label_text(&transition.label());
+            let mut label = EdgeLabel::default();
+            if !text.is_empty() {
+                let font = self.layout_config.edge_label_font_size as f64;
+                let widest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+                let line_count = text.lines().count().max(1);
+                label.width = widest as f64 * font * 0.55;
+                label.height = line_count as f64 * font * 1.6;
+            }
+
+            let name = format!("tr_{index}");
+            g.set_edge(
+                transition.source.as_str(),
+                transition.target.as_str(),
+                Some(label),
+                Some(name.as_str()),
+            );
+            edge_keys.push((
+                index,
+                transition.source.clone(),
+                transition.target.clone(),
+                name,
+            ));
+        }
+
+        if let Some(target) = initial.as_ref() {
+            if g.node(target.as_str()).is_some() {
+                g.set_edge(
+                    "[*]",
+                    target.as_str(),
+                    Some(EdgeLabel::default()),
+                    Some("__initial"),
+                );
+            }
+        }
+
+        layout(
+            &mut g,
+            Some(LayoutOptions {
+                rankdir: match self.layout_config.direction {
+                    LayoutDirection::TB => RankDir::TB,
+                    LayoutDirection::LR => RankDir::LR,
+                },
+                nodesep: self.layout_config.nodesep as f64,
+                ranksep: self.layout_config.ranksep as f64,
+                edgesep: self.layout_config.edgesep as f64,
+                marginx: self.layout_config.marginx as f64,
+                marginy: self.layout_config.marginy as f64,
+                ..Default::default()
+            }),
+        );
+
+        // The renderer positions everything relative to the canvas centre, so
+        // shift the whole diagram to be centred on the origin.
+        let mut raw: std::collections::HashMap<String, egui::Pos2> =
+            std::collections::HashMap::new();
+        let mut min = egui::pos2(f32::MAX, f32::MAX);
+        let mut max = egui::pos2(f32::MIN, f32::MIN);
+
+        let mut record = |name: &str, n: &NodeLabel| {
+            if let (Some(x), Some(y)) = (n.x, n.y) {
+                let p = egui::pos2(x as f32, y as f32);
+                raw.insert(name.to_string(), p);
+                min = egui::pos2(min.x.min(p.x), min.y.min(p.y));
+                max = egui::pos2(max.x.max(p.x), max.y.max(p.y));
+            }
+        };
+        for state in &fsm.states {
+            if let Some(n) = g.node(state.name.as_str()) {
+                record(&state.name, n);
+            }
+        }
+        if initial.is_some() {
+            if let Some(n) = g.node("[*]") {
+                record("[*]", n);
+            }
+        }
+        drop(record);
+
+        if raw.is_empty() {
+            self.state_positions.clear();
+            self.layout = Some(LayoutedDiagram::default());
+            return;
+        }
+        let centre = egui::vec2((min.x + max.x) * 0.5, (min.y + max.y) * 0.5);
+
+        self.state_positions.clear();
+        for (name, p) in &raw {
+            self.state_positions.insert(name.clone(), *p - centre);
+        }
+
+        let mut edges: Vec<LayoutedEdge> = Vec::new();
+        let mut labels: Vec<LayoutedLabel> = Vec::new();
+
+        for (index, source, target, name) in &edge_keys {
+            let Some(e) = g.edge(source.as_str(), target.as_str(), Some(name)) else {
+                continue;
+            };
+
+            let points: Vec<egui::Pos2> = e
+                .points
+                .iter()
+                .map(|p| egui::pos2(p.x as f32, p.y as f32) - centre)
+                .collect();
+            if points.len() < 2 {
                 continue;
             }
 
-            let transition_node_id = format!("__tr_{t_idx}");
+            let transition = &fsm.transitions[*index];
 
-            let raw_label = transition.label();
-            let label = format_label_text(&raw_label);
-
-            // Styling only (does NOT affect layout/routing)
-            let transition_type = {
-                let event_name = transition.event.as_ref().map(|e| e.name.to_lowercase()).unwrap_or_default();
-                if event_name.contains("timeout") || event_name.contains("timer") || event_name.contains("expired") {
-                    TransitionType::Timer
-                } else if transition.guard.is_some() {
-                    TransitionType::Conditional
-                } else {
-                    TransitionType::Forward
-                }
+            // "Reverse" means the target sits earlier along the rank direction,
+            // which is what the renderer colours differently.
+            let is_reverse = match (raw.get(source), raw.get(target)) {
+                (Some(a), Some(b)) => match self.layout_config.direction {
+                    LayoutDirection::TB => b.y < a.y,
+                    LayoutDirection::LR => b.x < a.x,
+                },
+                _ => false,
             };
 
-            transition_node_type.insert(transition_node_id.clone(), transition_type);
-
-            if label.is_empty() {
-                nodes_in.push(JsNodeIn {
-                    id: transition_node_id.clone(),
-                    width: 1.0,
-                    height: 1.0,
-                });
-            } else {
-                let label_size = Self::measure_text(ctx, &label, self.layout_config.edge_label_font_size);
-                nodes_in.push(JsNodeIn {
-                    id: transition_node_id.clone(),
-                    width: label_size.x + 14.0,
-                    height: label_size.y + 8.0,
-                });
-                label_node_text.insert(transition_node_id.clone(), label);
+            let text = format_label_text(&transition.label());
+            if !text.is_empty() {
+                if let (Some(x), Some(y)) = (e.x, e.y) {
+                    labels.push(LayoutedLabel {
+                        pos: egui::pos2(x as f32, y as f32) - centre,
+                        text,
+                    });
+                }
             }
 
-            edges_in.push(JsEdgeIn {
-                v: transition.source.clone(),
-                w: transition_node_id.clone(),
-                name: Some(format!("tr_{t_idx}_a")),
-                label_width: Some(0.0),
-                label_height: Some(0.0),
-            });
-            edges_in.push(JsEdgeIn {
-                v: transition_node_id.clone(),
-                w: transition.target.clone(),
-                name: Some(format!("tr_{t_idx}_b")),
-                label_width: Some(0.0),
-                label_height: Some(0.0),
+            edges.push(LayoutedEdge {
+                v: source.clone(),
+                w: target.clone(),
+                transition_index: Some(*index),
+                points,
+                transition_type: classify_transition(transition, is_reverse),
             });
         }
 
-        let input = JsLayoutInput {
-            graph: graph_cfg,
-            nodes: nodes_in,
-            edges: edges_in,
-        };
-
-        // Run JS Dagre (requires `npm install` in tools/dagre-svg-demo).
-        let demo_dir = dagre_demo_dir();
-        let script = demo_dir.join("src/layout_json.mjs");
-        if !script.exists() {
-            return Err(format!(
-                "Dagre layout script not found at: {}\n\nThis usually means the bundled resources are missing.\n\nDev: ensure tools/dagre-svg-demo exists.\nPackaged: ensure tools/dagre-svg-demo is shipped alongside the app (or set OXIDATE_DAGRE_DIR).",
-                script.display()
-            ));
-        }
-        let input_json = serde_json::to_vec(&input).map_err(|e| format!("Failed to serialize layout input: {e}"))?;
-
-        let node = node_binary();
-        let mut child = Command::new(&node)
-            .current_dir(&demo_dir)
-            .arg(script)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                format!(
-                    "Failed to spawn Node.js ({}): {e}\n\nIf Node is not installed, install it OR bundle it and set OXIDATE_NODE.\nAlso run: `cd tools/dagre-svg-demo && npm install` (or ship node_modules in releases).",
-                    node.display()
-                )
-            })?;
-
-        {
-            let stdin = child.stdin.as_mut().ok_or_else(|| "Failed to open stdin for Node.js".to_string())?;
-            stdin
-                .write_all(&input_json)
-                .map_err(|e| format!("Failed to write to Node.js stdin: {e}"))?;
-        }
-
-        let output = child
-            .wait_with_output()
-            .map_err(|e| format!("Failed to wait for Node.js: {e}"))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "Dagre (Node.js) layout failed.\n\nIf you haven't yet, run: `cd tools/dagre-svg-demo && npm install`\n\nError:\n{}",
-                stderr.trim()
-            ));
-        }
-
-        let js_layout: JsLayoutOutput = serde_json::from_slice(&output.stdout)
-            .map_err(|e| format!("Failed to parse Dagre output JSON: {e}"))?;
-
-        // Compute center using returned nodes/edge points.
-        let mut min_x = f32::INFINITY;
-        let mut min_y = f32::INFINITY;
-        let mut max_x = f32::NEG_INFINITY;
-        let mut max_y = f32::NEG_INFINITY;
-
-        for n in js_layout.nodes.values() {
-            min_x = min_x.min(n.x - n.width * 0.5);
-            max_x = max_x.max(n.x + n.width * 0.5);
-            min_y = min_y.min(n.y - n.height * 0.5);
-            max_y = max_y.max(n.y + n.height * 0.5);
-        }
-        for e in &js_layout.edges {
-            for p in &e.points {
-                min_x = min_x.min(p.x);
-                max_x = max_x.max(p.x);
-                min_y = min_y.min(p.y);
-                max_y = max_y.max(p.y);
-            }
-        }
-        if !min_x.is_finite() {
-            min_x = 0.0;
-            min_y = 0.0;
-            max_x = 0.0;
-            max_y = 0.0;
-        }
-        let center = egui::vec2((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
-
-        self.state_positions.clear();
-        for (id, n) in js_layout.nodes.iter() {
-            self.state_positions.insert(id.clone(), egui::pos2(n.x - center.x, n.y - center.y));
-        }
-
-        let mut layout_edges: Vec<LayoutedEdge> = Vec::new();
-        for e in &js_layout.edges {
-            let transition_type = if e.v.starts_with("__tr_") {
-                transition_node_type.get(&e.v).copied().unwrap_or(TransitionType::Forward)
-            } else if e.w.starts_with("__tr_") {
-                transition_node_type.get(&e.w).copied().unwrap_or(TransitionType::Forward)
-            } else {
-                TransitionType::Forward
-            };
-
-            let transition_index = e
-                .name
-                .as_deref()
-                .and_then(|name| name.strip_prefix("tr_"))
-                .and_then(|rest| rest.split('_').next())
-                .and_then(|n| n.parse::<usize>().ok());
-
-            layout_edges.push(LayoutedEdge {
-                v: e.v.clone(),
-                w: e.w.clone(),
-                transition_index,
-                points: e.points.iter().map(|p| egui::pos2(p.x - center.x, p.y - center.y)).collect(),
-                transition_type,
-            });
-        }
-
-        let mut layout_labels: Vec<LayoutedLabel> = Vec::new();
-        for (label_node_id, text) in label_node_text.iter() {
-            if let Some(n) = js_layout.nodes.get(label_node_id) {
-                layout_labels.push(LayoutedLabel {
-                    pos: egui::pos2(n.x - center.x, n.y - center.y),
-                    text: text.clone(),
-                });
+        if let Some(target) = initial.as_ref() {
+            if let Some(e) = g.edge("[*]", target.as_str(), Some(&"__initial".to_string())) {
+                let points: Vec<egui::Pos2> = e
+                    .points
+                    .iter()
+                    .map(|p| egui::pos2(p.x as f32, p.y as f32) - centre)
+                    .collect();
+                if points.len() >= 2 {
+                    edges.push(LayoutedEdge {
+                        v: "[*]".to_string(),
+                        w: target.clone(),
+                        transition_index: None,
+                        points,
+                        transition_type: TransitionType::Forward,
+                    });
+                }
             }
         }
 
-        self.layout = Some(LayoutedDiagram { edges: layout_edges, labels: layout_labels });
-        Ok(())
+        self.layout = Some(LayoutedDiagram { edges, labels });
     }
 
-    fn calculate_state_positions(&mut self) {
-        self.state_positions.clear();
-        
-        if let Some(fsm) = self.fsms.get(self.selected_fsm) {
-            let num_states = fsm.states.len();
-            if num_states == 0 {
-                return;
-            }
-
-            // Calculate state sizes first for proper spacing
-            let state_sizes: Vec<(String, egui::Vec2)> = fsm.states.iter()
-                .map(|s| (s.name.clone(), estimate_state_size(s)))
-                .collect();
-            
-            // Find max dimensions
-            let max_width = state_sizes.iter().map(|(_, sz)| sz.x).fold(0.0f32, |a, b| a.max(b));
-            let max_height = state_sizes.iter().map(|(_, sz)| sz.y).fold(0.0f32, |a, b| a.max(b));
-            
-            // Use much larger spacing to avoid collisions - significantly increased
-            let base_spacing_x = max_width + 280.0;  // Horizontal spacing
-            let base_spacing_y = max_height + 220.0; // Vertical spacing
-            
-            // Try to arrange in a grid that accommodates the FSM structure
-            // Analyze transitions to find levels
-            let levels = calculate_state_levels(fsm);
-            
-            if levels.is_empty() {
-                // Fallback: simple circle layout with large radius
-                let radius = (num_states as f32 * 50.0).max(200.0);
-                let center = egui::Pos2::new(0.0, 0.0);
-                
-                for (i, state) in fsm.states.iter().enumerate() {
-                    let angle = (i as f32 / num_states as f32) * 2.0 * std::f32::consts::PI - std::f32::consts::FRAC_PI_2;
-                    let x = center.x + radius * angle.cos();
-                    let y = center.y + radius * angle.sin();
-                    self.state_positions.insert(state.name.clone(), egui::Pos2::new(x, y));
-                }
-            } else {
-                // Use hierarchical layout based on levels
-                let mut level_counts: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
-                
-                for (_, level) in &levels {
-                    *level_counts.entry(*level).or_insert(0) += 1;
-                }
-                
-                let max_level = levels.values().max().copied().unwrap_or(0);
-                let mut level_current: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
-                
-                for (state_name, level) in &levels {
-                    let count_in_level = level_counts.get(level).copied().unwrap_or(1);
-                    let idx_in_level = *level_current.entry(*level).or_insert(0);
-                    *level_current.get_mut(level).unwrap() += 1;
-                    
-                    // Center the states in each level
-                    let level_width = (count_in_level - 1) as f32 * base_spacing_x;
-                    let start_x = -level_width / 2.0;
-                    
-                    let x = start_x + idx_in_level as f32 * base_spacing_x;
-                    let y = *level as f32 * base_spacing_y;
-                    
-                    self.state_positions.insert(state_name.clone(), egui::Pos2::new(x, y));
-                }
-                
-                // Apply force-directed adjustment to reduce overlaps
-                self.apply_force_layout(&levels, base_spacing_x * 0.8, base_spacing_y * 0.6);
-            }
-        }
-    }
     
-    /// Apply force-directed layout adjustment
-    fn apply_force_layout(&mut self, levels: &std::collections::HashMap<String, i32>, min_x: f32, min_y: f32) {
-        let iterations = 100;
-        let repulsion = 15000.0;
-        let attraction = 0.01;
-        
-        for _ in 0..iterations {
-            let positions_copy: Vec<(String, egui::Pos2)> = self.state_positions.iter()
-                .map(|(k, v)| (k.clone(), *v))
-                .collect();
-            
-            for (name, pos) in positions_copy.iter() {
-                let mut force = egui::Vec2::ZERO;
-                let my_level = levels.get(name).copied().unwrap_or(0);
-                
-                // Repulsion from other nodes
-                for (other_name, other_pos) in positions_copy.iter() {
-                    if name == other_name {
-                        continue;
-                    }
-                    
-                    let diff = *pos - *other_pos;
-                    let dist = diff.length().max(50.0);
-                    
-                    // Stronger repulsion for same level
-                    let other_level = levels.get(other_name).copied().unwrap_or(0);
-                    let level_factor = if my_level == other_level { 2.0 } else { 1.0 };
-                    
-                    force += diff.normalized() * (repulsion * level_factor / (dist * dist));
-                }
-                
-                // Attraction to center of level (horizontal only)
-                force.x += -pos.x * attraction;
-                
-                // Apply force with damping
-                let new_pos = *pos + force * 0.5;
-                
-                // Enforce minimum distances
-                let mut final_pos = new_pos;
-                for (other_name, other_pos) in positions_copy.iter() {
-                    if name == other_name {
-                        continue;
-                    }
-                    
-                    let diff = final_pos - *other_pos;
-                    let dx = diff.x.abs();
-                    let dy = diff.y.abs();
-                    
-                    let other_level = levels.get(other_name).copied().unwrap_or(0);
-                    
-                    // Enforce minimum distances
-                    if my_level == other_level && dx < min_x {
-                        let push = (min_x - dx) / 2.0 + 10.0;
-                        if diff.x >= 0.0 {
-                            final_pos.x += push;
-                        } else {
-                            final_pos.x -= push;
-                        }
-                    }
-                    
-                    if my_level != other_level && dy < min_y {
-                        let push = (min_y - dy) / 2.0 + 10.0;
-                        if diff.y >= 0.0 {
-                            final_pos.y += push;
-                        } else {
-                            final_pos.y -= push;
-                        }
-                    }
-                }
-                
-                self.state_positions.insert(name.clone(), final_pos);
-            }
-        }
-    }
     
     /// Create new FSMs with the given names (comma or space separated)
     fn create_new_fsms(&mut self, names_input: &str) {
@@ -1123,8 +850,20 @@ fsm {name} {{
     fn sim_reset_to_initial(&mut self, fsm: &FsmDefinition) {
         self.sim.queued_events.clear();
         self.sim.auto_accum_s = 0.0;
+        self.sim.auto_cursor = 0;
         self.sim.last_fired = None;
         self.sim.last_frame = None;
+
+        // Offer a sequence that actually drives *this* machine. Only when the
+        // field is untouched, so a sequence the user typed is never clobbered.
+        let suggested = Self::suggest_event_sequence(fsm);
+        if !suggested.is_empty()
+            && (self.sim.auto_event.trim().is_empty()
+                || self.sim.auto_event == self.sim.suggested_events)
+        {
+            self.sim.auto_event = suggested.clone();
+        }
+        self.sim.suggested_events = suggested;
 
         if let Some(initial) = &fsm.initial_state {
             self.sim.current_state = Some(initial.clone());
@@ -1440,18 +1179,11 @@ impl eframe::App for OxidateApp {
         // Engine-driven layout recomputation (FSM → Graph → Dagre → Renderer)
         if self.layout_dirty {
             if let Some(fsm) = self.fsms.get(self.selected_fsm).cloned() {
-                match self.compute_layout_with_dagre(ctx, &fsm) {
-                    Ok(()) => {
-                        // Keep parse errors (if any) intact; only clear layout-related errors.
-                        if let Some(msg) = &self.error_message {
-                            if msg.starts_with("Layout error:") {
-                                self.error_message = None;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.error_message = Some(format!("Layout error: {e}"));
-                        self.layout = None;
+                self.compute_layout_native(&fsm);
+                // Keep parse errors (if any) intact; only clear layout-related errors.
+                if let Some(msg) = &self.error_message {
+                    if msg.starts_with("Layout error:") {
+                        self.error_message = None;
                     }
                 }
             }
@@ -1735,7 +1467,7 @@ impl eframe::App for OxidateApp {
                 ui.separator();
                 ui.label("Layout:");
                 let mut dir_changed = false;
-                egui::ComboBox::from_id_source("layout_direction")
+                egui::ComboBox::from_id_salt("layout_direction")
                     .selected_text(match self.layout_config.direction {
                         LayoutDirection::TB => "TB",
                         LayoutDirection::LR => "LR",
@@ -1778,21 +1510,39 @@ impl eframe::App for OxidateApp {
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label("Event:");
-                        ui.text_edit_singleline(&mut self.sim.event_input);
+                        ui.label("Manual");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.sim.event_input)
+                                .desired_width(340.0)
+                                .hint_text("one event name, then press Post"),
+                        );
                         if ui.button("Post").clicked() {
                             let ev = self.sim.event_input.trim().to_string();
                             self.sim_post_event(ev);
                             self.sim.event_input.clear();
                         }
-                        ui.separator();
-                        ui.checkbox(&mut self.sim.auto_tick, "Auto");
-                        ui.add(egui::DragValue::new(&mut self.sim.auto_period_s).speed(0.1).clamp_range(0.1..=10.0).prefix("period ").suffix("s"));
-                        ui.label("event");
-                        ui.text_edit_singleline(&mut self.sim.auto_event);
                         if ui.button("Clear log").clicked() {
                             self.sim.log.clear();
                         }
+                    });
+
+                    // The auto-driver gets its own row, with the text field at
+                    // the same width as the manual one so the two read as a
+                    // pair rather than as one wrapped line.
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.sim.auto_tick, "Auto");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.sim.auto_event)
+                                .desired_width(340.0)
+                                .hint_text("event1, event2, … cycled while running"),
+                        );
+                        ui.label("every");
+                        ui.add(
+                            egui::DragValue::new(&mut self.sim.auto_period_s)
+                                .speed(0.1)
+                                .range(0.1..=10.0)
+                                .suffix("s"),
+                        );
                     });
 
                     // Per-frame sim update (auto event + stepping).
@@ -1809,8 +1559,17 @@ impl eframe::App for OxidateApp {
                             self.sim.auto_accum_s += dt_s;
                             while self.sim.auto_accum_s >= self.sim.auto_period_s {
                                 self.sim.auto_accum_s -= self.sim.auto_period_s;
-                                let ev = self.sim.auto_event.trim().to_string();
-                                if !ev.is_empty() {
+                                let sequence: Vec<String> = self
+                                    .sim
+                                    .auto_event
+                                    .split(',')
+                                    .map(|e| e.trim().to_string())
+                                    .filter(|e| !e.is_empty())
+                                    .collect();
+                                if !sequence.is_empty() {
+                                    let ev = sequence[self.sim.auto_cursor % sequence.len()].clone();
+                                    self.sim.auto_cursor =
+                                        (self.sim.auto_cursor + 1) % sequence.len();
                                     self.sim_post_event(ev);
                                 }
                             }
@@ -2031,272 +1790,10 @@ struct LabelInfo {
     font_size: f32,
 }
 
-/// Information about a state box for collision detection
-#[derive(Clone)]
-struct StateBox {
-    rect: egui::Rect,
-}
 
-/// Lane allocation for exclusive routing - each transition gets its own lane
-struct LaneAllocator {
-    /// Used lanes for horizontal segments at different Y positions
-    horizontal_lanes: Vec<f32>,
-    /// Used lanes for vertical segments at different X positions  
-    vertical_lanes: Vec<f32>,
-    /// Minimum spacing between lanes
-    lane_spacing: f32,
-}
 
-impl LaneAllocator {
-    fn new(zoom: f32) -> Self {
-        Self {
-            horizontal_lanes: Vec::new(),
-            vertical_lanes: Vec::new(),
-            lane_spacing: 35.0 * zoom, // Fixed spacing between lanes
-        }
-    }
-    
-    /// Allocate an exclusive horizontal lane, returns Y position
-    fn allocate_horizontal_lane(&mut self, preferred_y: f32) -> f32 {
-        // Find a lane that doesn't conflict with existing ones
-        let mut y = preferred_y;
-        let mut iteration = 0;
-        
-        let max_iterations = 6; // keep routes compact (avoid global detours)
-        loop {
-            let conflicts = self.horizontal_lanes.iter()
-                .any(|&existing| (existing - y).abs() < self.lane_spacing);
-            
-            if !conflicts {
-                self.horizontal_lanes.push(y);
-                return y;
-            }
-            
-            // Try alternating above/below
-            iteration += 1;
-            let offset = (iteration as f32 / 2.0).ceil() * self.lane_spacing;
-            y = if iteration % 2 == 0 {
-                preferred_y + offset
-            } else {
-                preferred_y - offset
-            };
-            
-            if iteration >= max_iterations {
-                // Fall back to preferred (compact) even if it reuses a lane.
-                self.horizontal_lanes.push(preferred_y);
-                return preferred_y;
-            }
-        }
-    }
-    
-    /// Allocate an exclusive vertical lane, returns X position
-    fn allocate_vertical_lane(&mut self, preferred_x: f32) -> f32 {
-        let mut x = preferred_x;
-        let mut iteration = 0;
 
-        let max_iterations = 6; // keep routes compact (avoid global detours)
-        loop {
-            let conflicts = self.vertical_lanes.iter()
-                .any(|&existing| (existing - x).abs() < self.lane_spacing);
-            
-            if !conflicts {
-                self.vertical_lanes.push(x);
-                return x;
-            }
-            
-            iteration += 1;
-            let offset = (iteration as f32 / 2.0).ceil() * self.lane_spacing;
-            x = if iteration % 2 == 0 {
-                preferred_x + offset
-            } else {
-                preferred_x - offset
-            };
-            
-            if iteration >= max_iterations {
-                // Fall back to preferred (compact) even if it reuses a lane.
-                self.vertical_lanes.push(preferred_x);
-                return preferred_x;
-            }
-        }
-    }
-}
 
-/// Determine relative position of two states for clockwise routing
-fn get_relative_position(from: egui::Pos2, to: egui::Pos2) -> &'static str {
-    let dx = to.x - from.x;
-    let dy = to.y - from.y;
-    
-    if dx.abs() > dy.abs() {
-        if dx > 0.0 { "right" } else { "left" }
-    } else {
-        if dy > 0.0 { "below" } else { "above" }
-    }
-}
-
-/// Calculate orthogonal route with EXCLUSIVE lane allocation
-fn calculate_orthogonal_route_with_lanes(
-    from_rect: egui::Rect,
-    to_rect: egui::Rect,
-    lane_index: i32,
-    zoom: f32,
-    transition_type: TransitionType,
-    lane_allocator: &mut LaneAllocator,
-) -> Vec<egui::Pos2> {
-    let mut points = Vec::new();
-    
-    let from = from_rect.center();
-    let to = to_rect.center();
-    
-    // Gap from state edge
-    let gap = 12.0 * zoom;
-    
-    // Base lane offset - each transition gets progressively further lanes
-    let lane_offset = lane_index.abs() as f32 * lane_allocator.lane_spacing;
-    
-    let dx = to.x - from.x;
-    let dy = to.y - from.y;
-    
-    let is_return = lane_index < 0;
-    let position = get_relative_position(from, to);
-    
-    match transition_type {
-        TransitionType::Timer => {
-            // Timer transitions: keep routing LOCAL and compact (Mermaid-like).
-            // Use ONE outside vertical lane X and ONE top lane Y (bounded), so we never create
-            // screen-wrapping rectangles.
-            let exit_point = egui::pos2(from_rect.center().x, from_rect.top() - gap);
-            let entry_point = egui::pos2(to_rect.center().x, to_rect.top() - gap);
-
-            // Local window around the two states
-            let margin = 220.0 * zoom;
-            let bbox = from_rect.union(to_rect).expand(margin);
-
-            // Top lane above the local bbox
-            let top_y = bbox.top() - (40.0 * zoom + lane_offset);
-            let lane_y = lane_allocator.allocate_horizontal_lane(top_y);
-
-            // Outside lane X (left/right) separated by lane_index
-            let side = if lane_index % 2 == 0 { -1.0 } else { 1.0 };
-            let desired_x = ((from_rect.center().x + to_rect.center().x) * 0.5)
-                + side * (70.0 * zoom + lane_offset);
-            let clamp_left = bbox.left() - 60.0 * zoom;
-            let clamp_right = bbox.right() + 60.0 * zoom;
-            let lane_x = lane_allocator.allocate_vertical_lane(desired_x.clamp(clamp_left, clamp_right));
-
-            points.push(exit_point);
-            points.push(egui::pos2(lane_x, exit_point.y));
-            points.push(egui::pos2(lane_x, lane_y));
-            points.push(egui::pos2(entry_point.x, lane_y));
-            points.push(entry_point);
-        }
-        TransitionType::Return | TransitionType::Conditional => {
-            // Return/Conditional: route OUTSIDE the main shape
-            match position {
-                "right" | "left" => {
-                    // Route below for horizontal returns
-                    let exit_point = egui::pos2(from_rect.center().x, from_rect.bottom() + gap);
-                    let entry_point = egui::pos2(to_rect.center().x, to_rect.bottom() + gap);
-                    
-                    let bottom_y = from_rect.bottom().max(to_rect.bottom()) + 50.0 * zoom + lane_offset;
-                    let lane_y = lane_allocator.allocate_horizontal_lane(bottom_y);
-                    
-                    points.push(exit_point);
-                    points.push(egui::pos2(exit_point.x, lane_y));
-                    points.push(egui::pos2(entry_point.x, lane_y));
-                    points.push(entry_point);
-                }
-                "above" | "below" => {
-                    // Route to the side for vertical returns
-                    let side = if is_return { -1.0 } else { 1.0 };
-                    let exit_point = if side > 0.0 {
-                        egui::pos2(from_rect.right() + gap, from_rect.center().y)
-                    } else {
-                        egui::pos2(from_rect.left() - gap, from_rect.center().y)
-                    };
-                    let entry_point = if side > 0.0 {
-                        egui::pos2(to_rect.right() + gap, to_rect.center().y)
-                    } else {
-                        egui::pos2(to_rect.left() - gap, to_rect.center().y)
-                    };
-                    
-                    let side_x = if side > 0.0 {
-                        from_rect.right().max(to_rect.right()) + 50.0 * zoom + lane_offset
-                    } else {
-                        from_rect.left().min(to_rect.left()) - 50.0 * zoom - lane_offset
-                    };
-                    let lane_x = lane_allocator.allocate_vertical_lane(side_x);
-                    
-                    points.push(exit_point);
-                    points.push(egui::pos2(lane_x, exit_point.y));
-                    points.push(egui::pos2(lane_x, entry_point.y));
-                    points.push(entry_point);
-                }
-                _ => {}
-            }
-        }
-        TransitionType::Forward => {
-            // Forward transitions: direct routes with exclusive lanes
-            if dx.abs() > dy.abs() * 0.5 {
-                // Horizontal dominant
-                let going_right = dx > 0.0;
-                
-                // Exit from appropriate side
-                let exit_y = from_rect.center().y;
-                let entry_y = to_rect.center().y;
-                
-                let exit_point = if going_right {
-                    egui::pos2(from_rect.right() + gap, exit_y)
-                } else {
-                    egui::pos2(from_rect.left() - gap, exit_y)
-                };
-                
-                let entry_point = if going_right {
-                    egui::pos2(to_rect.left() - gap, entry_y)
-                } else {
-                    egui::pos2(to_rect.right() + gap, entry_y)
-                };
-                
-                // Allocate exclusive vertical lane for the middle segment
-                let mid_x = (exit_point.x + entry_point.x) / 2.0 + lane_offset * if going_right { 1.0 } else { -1.0 };
-                let lane_x = lane_allocator.allocate_vertical_lane(mid_x);
-                
-                points.push(exit_point);
-                points.push(egui::pos2(lane_x, exit_point.y));
-                points.push(egui::pos2(lane_x, entry_point.y));
-                points.push(entry_point);
-            } else {
-                // Vertical dominant
-                let going_down = dy > 0.0;
-                
-                let exit_x = from_rect.center().x;
-                let entry_x = to_rect.center().x;
-                
-                let exit_point = if going_down {
-                    egui::pos2(exit_x, from_rect.bottom() + gap)
-                } else {
-                    egui::pos2(exit_x, from_rect.top() - gap)
-                };
-                
-                let entry_point = if going_down {
-                    egui::pos2(entry_x, to_rect.top() - gap)
-                } else {
-                    egui::pos2(entry_x, to_rect.bottom() + gap)
-                };
-                
-                // Allocate exclusive horizontal lane for middle segment
-                let mid_y = (exit_point.y + entry_point.y) / 2.0 + lane_offset * if going_down { 1.0 } else { -1.0 };
-                let lane_y = lane_allocator.allocate_horizontal_lane(mid_y);
-                
-                points.push(exit_point);
-                points.push(egui::pos2(exit_point.x, lane_y));
-                points.push(egui::pos2(entry_point.x, lane_y));
-                points.push(entry_point);
-            }
-        }
-    }
-    
-    points
-}
 
 /// Determine the type of transition for rendering decisions (layout is engine-driven).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2337,77 +1834,6 @@ fn classify_transition(transition: &fsm::Transition, is_reverse: bool) -> Transi
     }
 }
 
-/// Calculate label position - NEVER on the arrow, always offset to the side
-/// Rules:
-/// - Entry transitions: label on LEFT
-/// - Exit transitions: label on RIGHT  
-/// - Timer events: label ABOVE
-/// - All labels have large offset from arrows
-fn calculate_label_position(
-    route: &[egui::Pos2], 
-    offset_index: i32, 
-    zoom: f32,
-    transition_type: TransitionType,
-    from_rect: egui::Rect,
-    to_rect: egui::Rect,
-) -> egui::Pos2 {
-    if route.len() < 2 {
-        return egui::Pos2::ZERO;
-    }
-    
-    let p1 = route[0];
-    let p2 = if route.len() > 1 { route[1] } else { route[0] };
-    
-    // Calculate direction of first segment
-    let dir = (p2 - p1).normalized();
-    let perp = egui::vec2(-dir.y, dir.x);
-    
-    // Base offset - LARGE to ensure no collision with arrow
-    let base_perpendicular_offset = 50.0 * zoom;
-    let index_offset = offset_index.abs() as f32 * 25.0 * zoom;
-    
-    match transition_type {
-        TransitionType::Timer => {
-            // Timer events: position ABOVE and offset sideways (never on the arrow).
-            // Anchor near the routed lane (route[1] tends to be the timer's lane X).
-            let anchor = route.get(1).copied().unwrap_or_else(|| from_rect.center());
-            let side = if offset_index % 2 == 0 { -1.0 } else { 1.0 };
-            let label_x = anchor.x + side * (55.0 * zoom + index_offset * 0.2);
-            let label_y = anchor.y - (28.0 * zoom + index_offset * 0.4);
-            egui::pos2(label_x, label_y)
-        }
-        TransitionType::Return | TransitionType::Conditional => {
-            // Curved transitions: position along the outer curve
-            // Find the midpoint of the curved path
-            if route.len() >= 3 {
-                let mid_idx = route.len() / 2;
-                let curve_point = route[mid_idx];
-                
-                // Offset further from the curve
-                let to_center = (from_rect.center() + to_rect.center().to_vec2()) * 0.5;
-                let away_dir = (curve_point - to_center).normalized();
-                
-                curve_point + away_dir * (30.0 * zoom + index_offset)
-            } else {
-                // Fallback
-                let along_pos = p1 + (p2 - p1) * 0.3;
-                let side = if offset_index >= 0 { 1.0 } else { -1.0 };
-                along_pos + perp * (base_perpendicular_offset + index_offset) * side
-            }
-        }
-        TransitionType::Forward => {
-            // Straight transitions: position at 30% along, offset to the side
-            let along_pos = p1 + (p2 - p1) * 0.3;
-            
-            // Determine side based on direction (entry = left, exit = right)
-            // If going right/down, label on top/left; if going left/up, label on bottom/right
-            let side = if dir.x > 0.0 || dir.y > 0.0 { 1.0 } else { -1.0 };
-            let side = side * (if offset_index >= 0 { 1.0 } else { -1.0 });
-            
-            along_pos + perp * (base_perpendicular_offset + index_offset) * side
-        }
-    }
-}
 
 /// Format label text - break into multiple SHORT lines for better readability
 fn format_label_text(label: &str) -> String {
@@ -2471,163 +1897,10 @@ fn format_label_text(label: &str) -> String {
     result
 }
 
-/// Calculate label info for orthogonal transition
-fn calculate_label_info_orthogonal(
-    route: &[egui::Pos2],
-    transition: &fsm::Transition,
-    zoom: f32,
-    offset_index: i32,
-    transition_type: TransitionType,
-    from_rect: egui::Rect,
-    to_rect: egui::Rect,
-) -> Option<LabelInfo> {
-    let raw_label = transition.label();
-    if raw_label.is_empty() {
-        return None;
-    }
-    
-    // Format label - break into multiple SHORT lines
-    let label = format_label_text(&raw_label);
-    let lines: Vec<&str> = label.lines().collect();
-    let num_lines = lines.len();
-    
-    let label_pos = calculate_label_position(route, offset_index, zoom, transition_type, from_rect, to_rect);
-    
-    let font_size = 11.0 * zoom;
-    let char_width = font_size * 0.55;
-    
-    // Find longest line for width calculation
-    let max_line_len = lines.iter().map(|l| l.len()).max().unwrap_or(0);
-    let text_width = max_line_len as f32 * char_width;
-    let line_height = font_size * 1.3;
-    let text_height = line_height * num_lines as f32;
-    let padding = 5.0 * zoom;
-    
-    let rect = egui::Rect::from_center_size(
-        label_pos,
-        egui::vec2(text_width + padding * 2.0, text_height + padding),
-    );
-    
-    Some(LabelInfo {
-        pos: label_pos,
-        rect,
-        text: label,
-        font_size,
-    })
-}
 
-/// Check if two rectangles overlap with margin
-fn rects_overlap_with_margin(a: &egui::Rect, b: &egui::Rect, margin: f32) -> bool {
-    let a_expanded = a.expand(margin);
-    a_expanded.intersects(*b)
-}
 
-/// Calculate overlap depth between two rectangles
-fn overlap_depth(a: &egui::Rect, b: &egui::Rect) -> f32 {
-    if !a.intersects(*b) {
-        return 0.0;
-    }
-    
-    let x_overlap = (a.right().min(b.right()) - a.left().max(b.left())).max(0.0);
-    let y_overlap = (a.bottom().min(b.bottom()) - a.top().max(b.top())).max(0.0);
-    
-    x_overlap.min(y_overlap)
-}
 
-/// Resolve overlapping labels - considers both other labels AND state boxes
-fn resolve_label_overlaps(labels: &mut [LabelInfo], state_boxes: &[StateBox]) {
-    if labels.is_empty() {
-        return;
-    }
-    
-    let max_iterations = 150;
-    let margin = 8.0;
-    
-    for iteration in 0..max_iterations {
-        let mut any_collision = false;
-        
-        for i in 0..labels.len() {
-            let mut total_push = egui::Vec2::ZERO;
-            let mut push_count = 0;
-            
-            // Check collision with other labels
-            for j in 0..labels.len() {
-                if i == j {
-                    continue;
-                }
-                
-                if rects_overlap_with_margin(&labels[i].rect, &labels[j].rect, margin) {
-                    any_collision = true;
-                    let depth = overlap_depth(&labels[i].rect, &labels[j].rect);
-                    
-                    let center_i = labels[i].rect.center();
-                    let center_j = labels[j].rect.center();
-                    let diff = center_i - center_j;
-                    
-                    let push_dir = if diff.length() > 0.1 {
-                        diff.normalized()
-                    } else {
-                        egui::vec2(0.0, if i < j { -1.0 } else { 1.0 })
-                    };
-                    
-                    let push_amount = (depth + margin + 10.0) * 0.5;
-                    total_push += push_dir * push_amount;
-                    push_count += 1;
-                }
-            }
-            
-            // Check collision with state boxes
-            for state_box in state_boxes {
-                if rects_overlap_with_margin(&labels[i].rect, &state_box.rect, margin) {
-                    any_collision = true;
-                    let depth = overlap_depth(&labels[i].rect, &state_box.rect);
-                    
-                    let center_label = labels[i].rect.center();
-                    let center_state = state_box.rect.center();
-                    let diff = center_label - center_state;
-                    
-                    let push_dir = if diff.length() > 0.1 {
-                        diff.normalized()
-                    } else {
-                        egui::vec2(1.0, 0.0)
-                    };
-                    
-                    // Push harder away from states
-                    let push_amount = (depth + margin + 20.0) * 0.8;
-                    total_push += push_dir * push_amount;
-                    push_count += 1;
-                }
-            }
-            
-            if push_count > 0 {
-                let move_vec = total_push / push_count as f32;
-                labels[i].pos += move_vec;
-                labels[i].rect = labels[i].rect.translate(move_vec);
-            }
-        }
-        
-        if !any_collision {
-            break;
-        }
-        
-        // Add jitter to escape local minima
-        if iteration > 80 && iteration % 10 == 0 {
-            for (idx, label) in labels.iter_mut().enumerate() {
-                let jitter = egui::vec2(
-                    ((iteration + idx * 7) % 13) as f32 - 6.0,
-                    ((iteration + idx * 11) % 13) as f32 - 6.0,
-                );
-                label.pos += jitter;
-                label.rect = label.rect.translate(jitter);
-            }
-        }
-    }
-}
 
-/// Draw orthogonal arrow with arrowhead
-fn draw_orthogonal_arrow(painter: &egui::Painter, route: &[egui::Pos2], zoom: f32) {
-    draw_orthogonal_arrow_colored(painter, route, zoom, egui::Color32::from_rgb(160, 175, 195));
-}
 
 /// Draw orthogonal arrow with custom color
 fn draw_orthogonal_arrow_colored(painter: &egui::Painter, route: &[egui::Pos2], zoom: f32, color: egui::Color32) {
@@ -2665,7 +1938,7 @@ fn draw_orthogonal_arrow_colored(painter: &egui::Painter, route: &[egui::Pos2], 
 fn draw_label(painter: &egui::Painter, info: &LabelInfo) {
     // Background
     painter.rect_filled(info.rect, 3.0, egui::Color32::from_rgb(30, 35, 45));
-    painter.rect_stroke(info.rect, 3.0, egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)));
+    painter.rect_stroke(info.rect, 3.0, egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(70, 80, 95)));
     
     // Text
     painter.text(
@@ -2688,7 +1961,7 @@ fn draw_grid(painter: &egui::Painter, rect: egui::Rect, zoom: f32, offset: egui:
     while x < rect.right() {
         painter.line_segment(
             [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-            egui::Stroke::new(1.0, grid_color),
+            egui::Stroke::new(1.0_f32, grid_color),
         );
         x += grid_size;
     }
@@ -2697,7 +1970,7 @@ fn draw_grid(painter: &egui::Painter, rect: egui::Rect, zoom: f32, offset: egui:
     while y < rect.bottom() {
         painter.line_segment(
             [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-            egui::Stroke::new(1.0, grid_color),
+            egui::Stroke::new(1.0_f32, grid_color),
         );
         y += grid_size;
     }
@@ -2736,94 +2009,7 @@ fn estimate_state_size(state: &fsm::State) -> egui::Vec2 {
     egui::vec2(width, height)
 }
 
-/// Calculate hierarchical levels for states based on transitions
-fn calculate_state_levels(fsm: &fsm::FsmDefinition) -> std::collections::HashMap<String, i32> {
-    let mut levels: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
-    
-    // Find initial state
-    let initial = fsm.initial_state.as_ref();
-    
-    // BFS to assign levels
-    let mut queue: std::collections::VecDeque<(String, i32)> = std::collections::VecDeque::new();
-    
-    if let Some(init) = initial {
-        levels.insert(init.clone(), 0);
-        queue.push_back((init.clone(), 0));
-    } else if let Some(first_state) = fsm.states.first() {
-        levels.insert(first_state.name.clone(), 0);
-        queue.push_back((first_state.name.clone(), 0));
-    }
-    
-    // Build adjacency from transitions
-    let mut outgoing: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
-    for transition in &fsm.transitions {
-        if transition.source != "[*]" && !transition.target.starts_with("<<") && transition.target != "[*]" {
-            outgoing.entry(transition.source.clone())
-                .or_insert_with(Vec::new)
-                .push(transition.target.clone());
-        }
-    }
-    
-    // BFS
-    while let Some((state, level)) = queue.pop_front() {
-        if let Some(targets) = outgoing.get(&state) {
-            for target in targets {
-                if !levels.contains_key(target) {
-                    // Self-loops stay at same level
-                    let new_level = if target == &state { level } else { level + 1 };
-                    levels.insert(target.clone(), new_level);
-                    queue.push_back((target.clone(), new_level));
-                }
-            }
-        }
-    }
-    
-    // Assign remaining states that weren't reached
-    let max_level = levels.values().max().copied().unwrap_or(0);
-    for state in &fsm.states {
-        if !levels.contains_key(&state.name) {
-            levels.insert(state.name.clone(), max_level + 1);
-        }
-    }
-    
-    levels
-}
 
-/// Calculate the bounding rectangle for a state (used for routing and collision)
-fn calculate_state_rect(state: &fsm::State, pos: egui::Pos2, zoom: f32) -> egui::Rect {
-    let mut action_lines = Vec::new();
-    for entry in &state.entry_actions {
-        action_lines.push(format!("entry/ {}", entry.name));
-    }
-    for exit in &state.exit_actions {
-        action_lines.push(format!("exit/ {}", exit.name));
-    }
-    
-    let font_size = 10.0 * zoom;
-    let char_width = font_size * 0.55;
-    let line_height = font_size * 1.3;
-    
-    // Width based on name or actions, whichever is larger
-    let name_width = state.name.len() as f32 * 9.0 * zoom;
-    let action_width = action_lines.iter()
-        .map(|line| line.len() as f32 * char_width)
-        .max_by(|a, b| a.partial_cmp(b).unwrap())
-        .unwrap_or(0.0);
-    
-    let padding = 15.0 * zoom;
-    let width = name_width.max(action_width).max(80.0 * zoom) + padding * 2.0;
-    
-    // Height: header (name) + separator + actions area
-    let header_height = 22.0 * zoom;
-    let actions_height = if action_lines.is_empty() {
-        20.0 * zoom
-    } else {
-        (action_lines.len() as f32 * line_height) + padding
-    };
-    let height = header_height + actions_height;
-    
-    egui::Rect::from_center_size(pos, egui::vec2(width, height))
-}
 
 fn draw_state(
     painter: &egui::Painter,
