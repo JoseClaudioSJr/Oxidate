@@ -689,21 +689,21 @@ fn test_transition_shadowed_by_internal_gets_no_test() {
 fn test_generated_file_documents_how_to_use_it() {
     let code = generate(CONNECTION_MANAGER);
 
-    assert!(code.contains("//! # Usage"));
+    assert!(code.contains("/// # Usage"));
     // Real names, not generic boilerplate.
-    assert!(code.contains("//! impl ConnectionManagerActions for Hardware {"));
-    assert!(code.contains("//! let mut machine = ConnectionManager::new(Hardware::new());"));
-    assert!(code.contains("//! assert_eq!(machine.state(), ConnectionManagerState::Disconnected);"));
+    assert!(code.contains("/// impl ConnectionManagerActions for Hardware {"));
+    assert!(code.contains("/// let mut machine = ConnectionManager::new(Hardware::new());"));
+    assert!(code.contains("/// assert_eq!(machine.state(), ConnectionManagerState::Disconnected);"));
     // `ignore` because Hardware is illustrative; a doctest would fail to compile.
-    assert!(code.contains("//! ```ignore"));
+    assert!(code.contains("/// ```ignore"));
 }
 
 #[test]
 fn test_usage_doc_shows_a_real_transition() {
     let code = generate(CONNECTION_MANAGER);
 
-    assert!(code.contains("//! machine.process(ConnectionManagerEvent::Connect);"));
-    assert!(code.contains("//! assert_eq!(machine.state(), ConnectionManagerState::Connecting);"));
+    assert!(code.contains("/// machine.process(ConnectionManagerEvent::Connect);"));
+    assert!(code.contains("/// assert_eq!(machine.state(), ConnectionManagerState::Connecting);"));
 }
 
 #[test]
@@ -809,5 +809,43 @@ fn test_ordinary_names_are_not_rejected() {
     assert!(
         generate_rust_code(&fsms[0]).is_ok(),
         "valid names were rejected"
+    );
+}
+
+#[test]
+fn test_generated_code_has_no_inner_doc_comments() {
+    // An inner doc comment is illegal inside `include!`, which is how build.rs
+    // output is normally consumed. The only one allowed is inside the generated
+    // test module, which is a module of its own.
+    let code = generate(CONNECTION_MANAGER);
+
+    let offenders: Vec<&str> = code
+        .lines()
+        .filter(|line| line.trim_start().starts_with("//!"))
+        .filter(|line| !line.contains("Regenerated whenever the FSM changes"))
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "inner doc comments outside the test module: {offenders:?}"
+    );
+}
+
+#[test]
+fn test_usage_doc_is_attached_to_the_struct() {
+    let code = generate(CONNECTION_MANAGER);
+
+    let usage = code.find("/// # Usage").expect("usage doc missing");
+    let decl = code
+        .find("pub struct ConnectionManager<")
+        .expect("struct missing");
+
+    assert!(usage < decl, "usage doc must precede the struct it documents");
+    // Nothing but doc lines between them.
+    assert!(
+        code[usage..decl]
+            .lines()
+            .all(|l| l.trim().is_empty() || l.trim_start().starts_with("///")),
+        "usage doc is detached from the struct"
     );
 }
