@@ -92,7 +92,15 @@ internal_transition = { identifier ~ guard? ~ "/" ~ action_call }
 internal_action = { identifier ~ "/" ~ action_call }
 
 action_call = { identifier ~ ("(" ~ params? ~ ")")? }
-params = { identifier ~ ("," ~ identifier)* }
+params = { param ~ ("," ~ param)* }
+
+// An action parameter is a string literal, a whole number, or a bare
+// identifier. The identifier form names something in the model — a timer, say —
+// and is generated as a string, since the machine has no other way to refer to
+// it.
+param = { string_literal | signed_number | identifier }
+string_literal = @{ "\"" ~ (!"\"" ~ ANY)* ~ "\"" }
+signed_number = @{ "-"? ~ ASCII_DIGIT+ }
 
 // ============================================================================
 // TRANSITIONS

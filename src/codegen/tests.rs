@@ -62,8 +62,10 @@ fn test_all_entry_actions_are_emitted() {
         code.contains("self.context.initiate_connection();"),
         "first entry action never invoked in process():\n{code}"
     );
+    // Takes the timer name: `start_timer(connect_timeout)` and
+    // `start_timer(keepalive)` must be distinguishable by the implementer.
     assert!(
-        code.contains("fn start_timer(&mut self);"),
+        code.contains("fn start_timer(&mut self, arg1: &str);"),
         "second entry action missing from the actions trait:\n{code}"
     );
 }
@@ -191,9 +193,10 @@ fn test_guarded_internal_transition_leaves_external_reachable() {
 fn test_trait_methods_are_deduplicated() {
     let code = generate(CONNECTION_MANAGER);
 
-    // start_timer appears as an entry action in two different states.
+    // start_timer appears as an entry action in two different states, with a
+    // different argument each time. One method, called twice.
     assert_eq!(
-        code.matches("fn start_timer(&mut self);").count(),
+        code.matches("fn start_timer(&mut self, arg1: &str);").count(),
         1,
         "actions trait declares the same method twice:\n{code}"
     );
@@ -1005,4 +1008,109 @@ fn test_a_state_routed_to_final_is_not_a_trap() {
 fn test_a_sound_machine_produces_no_warnings() {
     let code = generate(CONNECTION_MANAGER);
     assert!(!code.contains("// Warning:"), "unexpected warnings:\n{code}");
+}
+
+#[test]
+fn test_action_parameters_reach_the_trait_and_the_call_site() {
+    // Parameters used to parse and then be discarded, so `start_timer(keepalive)`
+    // and `start_timer(watchdog)` collapsed into one parameterless method and the
+    // implementer could not tell which timer to start.
+    let code = generate(
+        r#"
+        fsm Probe {
+            [*] --> Idle
+            state Idle
+            state Waiting { entry / start_timer(response_timeout) }
+            state Connected { entry / start_timer(keepalive) }
+            state Failed
+            Idle --> Waiting : Start
+            Waiting --> Connected : Ok
+            Connected --> Failed : Reset / reset_with_code(0)
+        }
+    "#,
+    );
+
+    assert!(code.contains("fn start_timer(&mut self, arg1: &str);"));
+    assert!(code.contains(r#"self.context.start_timer("response_timeout");"#));
+    assert!(code.contains(r#"self.context.start_timer("keepalive");"#));
+
+    // A whole number stays a number.
+    assert!(code.contains("fn reset_with_code(&mut self, arg1: i64);"));
+    assert!(code.contains("self.context.reset_with_code(0);"));
+}
+
+#[test]
+fn test_string_literal_parameters_are_accepted() {
+    // Documented in DSL_REFERENCE.md and previously rejected by the grammar.
+    let code = generate(
+        r#"
+        fsm Probe {
+            [*] --> Idle
+            state Idle
+            state Logging { entry / log_message("Entered logging state") }
+            Idle --> Logging : Go
+        }
+    "#,
+    );
+
+    assert!(code.contains("fn log_message(&mut self, arg1: &str);"));
+    assert!(code.contains(r#"self.context.log_message("Entered logging state");"#));
+}
+
+#[test]
+fn test_negative_numbers_are_accepted() {
+    let code = generate(
+        r#"
+        fsm Probe {
+            [*] --> A
+            state A
+            state B
+            A --> B : Go / set_offset(-1)
+        }
+    "#,
+    );
+
+    assert!(code.contains("fn set_offset(&mut self, arg1: i64);"));
+    assert!(code.contains("self.context.set_offset(-1);"));
+}
+
+#[test]
+fn test_inconsistent_arity_is_rejected() {
+    // One trait method cannot take a different number of arguments per call.
+    let errors = expect_errors(
+        r#"
+        fsm Probe {
+            [*] --> A
+            state A { entry / log(one) }
+            state B { entry / log(one, two) }
+            A --> B : Go
+        }
+    "#,
+    );
+
+    assert!(
+        errors.iter().any(|e| e.contains("argument")),
+        "expected an arity error, got {errors:?}"
+    );
+}
+
+#[test]
+fn test_a_position_used_with_both_kinds_becomes_a_string() {
+    // A single non-integer use decides the position: `&str` accepts both.
+    let code = generate(
+        r#"
+        fsm Probe {
+            [*] --> Idle
+            state Idle
+            state A { entry / mark(1) }
+            state B { entry / mark(start) }
+            Idle --> A : Go
+            A --> B : Next
+        }
+    "#,
+    );
+
+    assert!(code.contains("fn mark(&mut self, arg1: &str);"));
+    assert!(code.contains(r#"self.context.mark("1");"#));
+    assert!(code.contains(r#"self.context.mark("start");"#));
 }
