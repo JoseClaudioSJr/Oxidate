@@ -16,6 +16,16 @@ use fsm::{FsmDefinition, StateType};
 use parser::parse_fsm;
 use codegen::{generate_rust_code_with_target, CodegenTarget};
 
+/// Renders validation errors as a Rust comment block, so the code panel shows
+/// what is wrong instead of silently keeping the previous FSM's output.
+fn format_codegen_errors(fsm_name: &str, errors: &[String]) -> String {
+    let mut out = format!("// Cannot generate code for FSM '{}':\n", fsm_name);
+    for error in errors {
+        out.push_str(&format!("//   - {}\n", error));
+    }
+    out
+}
+
 use serde::{Deserialize, Serialize};
 
 fn oxidate_icon() -> egui::IconData {
@@ -454,7 +464,8 @@ impl OxidateApp {
     
     fn regenerate_code(&mut self) {
         if let Some(fsm) = self.fsms.get(self.selected_fsm) {
-            self.generated_code = generate_rust_code_with_target(fsm, self.codegen_target);
+            self.generated_code = generate_rust_code_with_target(fsm, self.codegen_target)
+                .unwrap_or_else(|errors| format_codegen_errors(&fsm.name, &errors));
         } else {
             self.generated_code = format!("// No FSM at index {}", self.selected_fsm);
         }
@@ -1047,8 +1058,15 @@ fsm {name} {{
         for fsm in &self.fsms {
             let snake_name = to_snake_case(&fsm.name);
             
-            // Generate code for each target
-            let code = generate_rust_code_with_target(fsm, self.codegen_target);
+            // Generate code for each target. A definition that fails
+            // validation is skipped rather than written out broken.
+            let code = match generate_rust_code_with_target(fsm, self.codegen_target) {
+                Ok(code) => code,
+                Err(errors) => {
+                    eprintln!("{}", format_codegen_errors(&fsm.name, &errors));
+                    continue;
+                }
+            };
             
             // Write the FSM file
             let filename = format!("{}.rs", snake_name);
@@ -1639,7 +1657,8 @@ impl eframe::App for OxidateApp {
                     if tab_changed {
                         self.mark_layout_dirty();
                         if let Some(fsm) = self.fsms.get(self.selected_fsm) {
-                            self.generated_code = generate_rust_code_with_target(fsm, self.codegen_target);
+                            self.generated_code = generate_rust_code_with_target(fsm, self.codegen_target)
+                .unwrap_or_else(|errors| format_codegen_errors(&fsm.name, &errors));
                         }
                     }
                     
@@ -1661,7 +1680,8 @@ impl eframe::App for OxidateApp {
                         if !self.generated_code.contains(&expected_header) {
                             // Force regenerate if mismatch
                             if let Some(fsm) = self.fsms.get(self.selected_fsm) {
-                                self.generated_code = generate_rust_code_with_target(fsm, self.codegen_target);
+                                self.generated_code = generate_rust_code_with_target(fsm, self.codegen_target)
+                .unwrap_or_else(|errors| format_codegen_errors(&fsm.name, &errors));
                             }
                         }
                         
