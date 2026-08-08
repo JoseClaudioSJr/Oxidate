@@ -11,17 +11,22 @@ documentation = "https://docs.rs/oxidate-fsm"
 readme = "README.md"
 rust-version = "1.70"
 keywords = ["fsm", "state-machine", "code-generator", "embedded", "gui"]
-categories = ["development-tools", "embedded"]
+categories = ["development-tools", "development-tools::build-utils", "embedded"]
 
 # Keep the published crate small and focused.
 # (GUI demo assets and packaging/tooling remain available on GitHub.)
+#
+# `docs/` is deliberately not shipped: it is reference material that tracks
+# intent rather than the implementation, so publishing it to crates.io would
+# distribute documentation for behaviour the generator does not yet have. It
+# stays on GitHub, where it is versioned alongside the issues that describe the
+# gaps.
 include = [
     "/Cargo.toml",
     "/README.md",
     "/LICENSE",
     "/src/**",
     "/examples/**",
-    "/docs/**",
 ]
 
 [features]

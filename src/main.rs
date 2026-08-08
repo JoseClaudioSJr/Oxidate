@@ -270,7 +270,10 @@ impl OxidateApp {
             show_generated_panel: true,
             zoom: 1.0,
             pan_offset: egui::Vec2::ZERO,
-            codegen_target: CodegenTarget::Embassy, // Default to Embassy for embedded
+            // Standard is the only target that generates working code; the
+            // others emit a stub, so defaulting to one of them meant a new
+            // user's very first output was a placeholder.
+            codegen_target: CodegenTarget::Standard,
             show_new_fsm_dialog: false,
             new_fsm_name: String::new(),
             sim: Simulator::default(),
@@ -1382,14 +1385,41 @@ impl eframe::App for OxidateApp {
                                 CodegenTarget::Rtic => "⚡ RTIC (interrupt-driven)",
                             })
                             .show_ui(ui, |ui| {
-                                ui.selectable_value(&mut self.codegen_target, CodegenTarget::Standard, "🖥 Standard (std)");
-                                ui.selectable_value(&mut self.codegen_target, CodegenTarget::Embassy, "🔌 Embassy (async embedded)");
-                                ui.selectable_value(&mut self.codegen_target, CodegenTarget::Rtic, "⚡ RTIC (interrupt-driven)");
+                                for (target, label) in [
+                                    (CodegenTarget::Standard, "🖥 Standard (std)"),
+                                    (CodegenTarget::Embassy, "🔌 Embassy (async embedded)"),
+                                    (CodegenTarget::Rtic, "⚡ RTIC (interrupt-driven)"),
+                                ] {
+                                    // Selectable either way, so the target can be
+                                    // inspected — but marked, so the stub it emits
+                                    // is not mistaken for a generation failure.
+                                    let text = if target.is_available() {
+                                        label.to_string()
+                                    } else {
+                                        format!("{label}  · Pro")
+                                    };
+                                    let item = ui.selectable_value(
+                                        &mut self.codegen_target,
+                                        target,
+                                        text,
+                                    );
+                                    if let Some(message) = target.upgrade_message() {
+                                        item.on_hover_text(message);
+                                    }
+                                }
                             });
                         if self.codegen_target != prev_target {
                             self.regenerate_code();
                         }
                     });
+
+                    if let Some(message) = self.codegen_target.upgrade_message() {
+                        ui.label(
+                            egui::RichText::new(message)
+                                .small()
+                                .color(egui::Color32::from_rgb(220, 180, 90)),
+                        );
+                    }
                     
                     ui.separator();
                     
