@@ -185,6 +185,8 @@ struct TestConnectionActions {
     keepalive_count: Rc<RefCell<u32>>,
 }
 
+// Helper methods kept for illustration; not every one is exercised here.
+#[allow(dead_code)]
 impl TestConnectionActions {
     fn new() -> Self {
         Self::default()

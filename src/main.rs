@@ -5,16 +5,11 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-mod fsm;
-mod parser;
-mod codegen;
-
-use fsm::{FsmDefinition, StateType};
-use parser::parse_fsm;
-use codegen::{generate_rust_code_with_target, CodegenTarget};
+use oxidate_fsm::fsm::{self, FsmDefinition, StateType};
+use oxidate_fsm::parser::parse_fsm;
+use oxidate_fsm::codegen::{generate_rust_code_with_target, CodegenTarget};
 
 /// Renders validation errors as a Rust comment block, so the code panel shows
 /// what is wrong instead of silently keeping the previous FSM's output.
@@ -86,105 +81,7 @@ fn oxidate_icon() -> egui::IconData {
     egui::IconData { rgba, width: w, height: h }
 }
 
-fn dagre_demo_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("OXIDATE_DAGRE_DIR") {
-        let p = PathBuf::from(dir);
-        if p.join("src/layout_json.mjs").exists() {
-            return p;
-        }
-    }
 
-    // When bundled on macOS, resources live at:
-    //   Oxidate.app/Contents/Resources/
-    // and our demo is copied to:
-    //   .../Resources/tools/dagre-svg-demo/
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            // macOS bundle: Contents/MacOS/<bin>
-            if let Some(contents_dir) = exe_dir.parent() {
-                let resources = contents_dir.join("Resources").join("tools/dagre-svg-demo");
-                if resources.join("src/layout_json.mjs").exists() {
-                    return resources;
-                }
-            }
-
-            // Generic "resources" layout (zip/AppDir): <exe_dir>/resources/tools/dagre-svg-demo
-            let resources = exe_dir.join("resources").join("tools/dagre-svg-demo");
-            if resources.join("src/layout_json.mjs").exists() {
-                return resources;
-            }
-
-            // Next to executable: <exe_dir>/tools/dagre-svg-demo
-            let sibling = exe_dir.join("tools/dagre-svg-demo");
-            if sibling.join("src/layout_json.mjs").exists() {
-                return sibling;
-            }
-
-            // AppImage-style: <AppDir>/usr/bin/<bin> → <AppDir>/usr/share/oxidate/tools/dagre-svg-demo
-            if let Some(usr_dir) = exe_dir.parent() {
-                let appimage = usr_dir.join("share/oxidate/tools/dagre-svg-demo");
-                if appimage.join("src/layout_json.mjs").exists() {
-                    return appimage;
-                }
-            }
-        }
-    }
-
-    // Dev fallback
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tools/dagre-svg-demo")
-}
-
-fn node_binary() -> PathBuf {
-    if let Ok(p) = std::env::var("OXIDATE_NODE") {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            return pb;
-        }
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(exe_dir) = exe.parent() {
-            // macOS bundle: Contents/MacOS/<bin> → Contents/Resources/node/bin/node
-            if let Some(contents_dir) = exe_dir.parent() {
-                let mac_node = contents_dir.join("Resources/node/bin/node");
-                if mac_node.exists() {
-                    return mac_node;
-                }
-            }
-
-            // Windows zip: <exe_dir>/node/node.exe
-            #[cfg(windows)]
-            {
-                let win_node = exe_dir.join("node/node.exe");
-                if win_node.exists() {
-                    return win_node;
-                }
-                let win_node = exe_dir.join("resources/node/node.exe");
-                if win_node.exists() {
-                    return win_node;
-                }
-            }
-
-            // Linux AppImage / generic: <AppDir>/usr/bin/<bin> → <AppDir>/usr/lib/oxidate/node/bin/node
-            #[cfg(not(windows))]
-            {
-                let unix_node = exe_dir.join("node/bin/node");
-                if unix_node.exists() {
-                    return unix_node;
-                }
-                if let Some(usr_dir) = exe_dir.parent() {
-                    let appimage_node = usr_dir.join("lib/oxidate/node/bin/node");
-                    if appimage_node.exists() {
-                        return appimage_node;
-                    }
-                }
-            }
-        }
-    }
-
-    // Fallback to PATH lookup.
-    PathBuf::from("node")
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LayoutDirection {
@@ -308,7 +205,13 @@ struct Simulator {
     event_input: String,
 
     auto_tick: bool,
+    /// Comma-separated event names, cycled one per tick. A single name repeats
+    /// forever, which only drives machines whose transitions all share an event.
     auto_event: String,
+    /// What `suggest_event_sequence` last offered. Lets Reset refresh the
+    /// suggestion when the user has not typed their own sequence.
+    suggested_events: String,
+    auto_cursor: usize,
     auto_period_s: f32,
     auto_accum_s: f32,
 
@@ -318,6 +221,7 @@ struct Simulator {
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // deserialisation targets; not every field is read
 struct SimFired {
     transition_index: Option<usize>,
     from: String,
@@ -337,7 +241,12 @@ impl Default for Simulator {
             queued_events: std::collections::VecDeque::new(),
             event_input: String::new(),
             auto_tick: false,
-            auto_event: "timer_expired".to_string(),
+            // Matches examples/traffic_light.fsm, so Auto + Run cycles out of
+            // the box. The previous default, "timer_expired", matched nothing
+            // in any shipped example.
+            auto_event: "TimerExpired".to_string(),
+            suggested_events: "TimerExpired".to_string(),
+            auto_cursor: 0,
             auto_period_s: 1.0,
             auto_accum_s: 0.0,
             last_frame: None,
@@ -483,307 +392,265 @@ impl OxidateApp {
         })
     }
 
-    fn compute_layout_with_dagre(&mut self, ctx: &egui::Context, fsm: &FsmDefinition) -> Result<(), String> {
-        #[derive(Serialize)]
-        struct JsGraphCfg {
-            rankdir: String,
-            nodesep: f32,
-            ranksep: f32,
-            edgesep: f32,
-            marginx: f32,
-            marginy: f32,
-        }
 
-        #[derive(Serialize)]
-        struct JsNodeIn {
-            id: String,
-            width: f32,
-            height: f32,
-        }
-
-        #[derive(Serialize)]
-        struct JsEdgeIn {
-            v: String,
-            w: String,
-            name: Option<String>,
-            #[serde(rename = "labelWidth")]
-            label_width: Option<f32>,
-            #[serde(rename = "labelHeight")]
-            label_height: Option<f32>,
-        }
-
-        #[derive(Serialize)]
-        struct JsLayoutInput {
-            graph: JsGraphCfg,
-            nodes: Vec<JsNodeIn>,
-            edges: Vec<JsEdgeIn>,
-        }
-
-        #[derive(Deserialize)]
-        struct JsPoint {
-            x: f32,
-            y: f32,
-        }
-
-        #[derive(Deserialize)]
-        struct JsNodeOut {
-            x: f32,
-            y: f32,
-            width: f32,
-            height: f32,
-        }
-
-        #[derive(Deserialize)]
-        struct JsGraphOut {
-            width: f32,
-            height: f32,
-        }
-
-        #[derive(Deserialize)]
-        struct JsEdgeOut {
-            v: String,
-            w: String,
-            name: Option<String>,
-            points: Vec<JsPoint>,
-            x: Option<f32>,
-            y: Option<f32>,
-        }
-
-        #[derive(Deserialize)]
-        struct JsLayoutOutput {
-            graph: JsGraphOut,
-            nodes: std::collections::HashMap<String, JsNodeOut>,
-            edges: Vec<JsEdgeOut>,
-        }
-
-        // Graph config to send to JS Dagre.
-        let graph_cfg = JsGraphCfg {
-            rankdir: match self.layout_config.direction {
-                LayoutDirection::TB => "tb".to_string(),
-                LayoutDirection::LR => "lr".to_string(),
-            },
-            nodesep: self.layout_config.nodesep,
-            ranksep: self.layout_config.ranksep,
-            edgesep: self.layout_config.edgesep,
-            marginx: self.layout_config.marginx,
-            marginy: self.layout_config.marginy,
+    /// Walks the machine from its initial state and returns the events needed to
+    /// drive it, as a comma-separated list for the Auto field.
+    ///
+    /// Derived from the FSM rather than hardcoded per example, so a machine the
+    /// user just wrote gets a working sequence too. Prefers transitions it has
+    /// not taken yet, which tends to cover the whole graph before repeating.
+    fn suggest_event_sequence(fsm: &FsmDefinition) -> String {
+        let Some(initial) = fsm.initial_state.clone() else {
+            return String::new();
         };
 
-        // Nodes.
-        let mut nodes_in: Vec<JsNodeIn> = Vec::new();
+        let mut sequence: Vec<String> = Vec::new();
+        let mut taken: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut current = initial.clone();
+
+        // Bounded: a machine with a trap state would otherwise never terminate.
+        for _ in 0..24 {
+            let outgoing: Vec<(usize, &fsm::Transition)> = fsm
+                .transitions
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| t.source == current && t.event.is_some())
+                .collect();
+
+            if outgoing.is_empty() {
+                break;
+            }
+
+            // An untaken transition first; otherwise fall back to the first one
+            // so the walk keeps moving instead of dead-ending.
+            let (index, transition) = outgoing
+                .iter()
+                .find(|(i, _)| !taken.contains(i))
+                .copied()
+                .unwrap_or(outgoing[0]);
+
+            taken.insert(index);
+            if let Some(event) = &transition.event {
+                sequence.push(event.name.clone());
+            }
+            current = transition.target.clone();
+
+            // Back where we started having used every transition: a full cycle.
+            if current == initial && taken.len() == fsm.transitions.len() {
+                break;
+            }
+        }
+
+        sequence.join(", ")
+    }
+
+
+    /// Pure-Rust layout, via the `dagre` crate — a port of dagre.js.
+    ///
+    /// Replaces the previous path, which spawned Node to run dagre.js and
+    /// parsed its JSON back. Same algorithm, no subprocess, nothing to ship
+    /// alongside the binary.
+    ///
+    /// Edge labels are given a size on the graph, so the layout reserves room
+    /// for them rather than leaving them to land on top of a state box.
+    fn compute_layout_native(&mut self, fsm: &FsmDefinition) {
+        use dagre::graph::{Graph, GraphOptions};
+        use dagre::{layout, EdgeLabel, LayoutOptions, NodeLabel, RankDir};
+
+        let mut g: Graph<NodeLabel, EdgeLabel> = Graph::with_options(GraphOptions {
+            directed: true,
+            multigraph: true,
+            compound: false,
+        });
+
         for state in &fsm.states {
             let size = estimate_state_size(state);
-            nodes_in.push(JsNodeIn {
-                id: state.name.clone(),
-                width: size.x,
-                height: size.y,
-            });
+            let mut node = NodeLabel::default();
+            node.width = size.x as f64;
+            node.height = size.y as f64;
+            g.set_node(state.name.as_str(), Some(node));
         }
 
-        // Pseudo start node.
-        let start_id = "[*]".to_string();
-        let has_start = fsm.transitions.iter().any(|t| t.source == "[*]");
-        if has_start {
-            nodes_in.push(JsNodeIn {
-                id: start_id.clone(),
-                width: 16.0,
-                height: 16.0,
-            });
+        // The initial pseudo-state renders as a small filled circle.
+        let initial = fsm.initial_state.clone();
+        if initial.is_some() {
+            let mut node = NodeLabel::default();
+            node.width = 16.0;
+            node.height = 16.0;
+            g.set_node("[*]", Some(node));
         }
 
-        // Represent every transition as an intermediate node (optionally sized to the label).
-        let mut transition_node_type: std::collections::HashMap<String, TransitionType> = std::collections::HashMap::new();
-        let mut label_node_text: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        let mut edges_in: Vec<JsEdgeIn> = Vec::new();
+        // dagre needs a distinct name per parallel edge; the index doubles as
+        // the way back to the transition once layout has run.
+        let mut edge_keys: Vec<(usize, String, String, String)> = Vec::new();
 
-        for (t_idx, transition) in fsm.transitions.iter().enumerate() {
+        for (index, transition) in fsm.transitions.iter().enumerate() {
             if transition.source == "[*]" {
-                edges_in.push(JsEdgeIn {
-                    v: start_id.clone(),
-                    w: transition.target.clone(),
-                    name: Some(format!("start_{t_idx}")),
-                    label_width: Some(0.0),
-                    label_height: Some(0.0),
-                });
+                continue; // handled as the initial pseudo-edge below
+            }
+            if g.node(transition.source.as_str()).is_none()
+                || g.node(transition.target.as_str()).is_none()
+            {
+                continue; // endpoint not laid out (e.g. a choice point)
+            }
+
+            let text = transition.label();
+            let mut label = EdgeLabel::default();
+            if !text.is_empty() {
+                let font = self.layout_config.edge_label_font_size as f64;
+                label.width = text.chars().count() as f64 * font * 0.55;
+                label.height = font * 1.6;
+            }
+
+            let name = format!("tr_{index}");
+            g.set_edge(
+                transition.source.as_str(),
+                transition.target.as_str(),
+                Some(label),
+                Some(name.as_str()),
+            );
+            edge_keys.push((
+                index,
+                transition.source.clone(),
+                transition.target.clone(),
+                name,
+            ));
+        }
+
+        if let Some(target) = initial.as_ref() {
+            if g.node(target.as_str()).is_some() {
+                g.set_edge(
+                    "[*]",
+                    target.as_str(),
+                    Some(EdgeLabel::default()),
+                    Some("__initial"),
+                );
+            }
+        }
+
+        layout(
+            &mut g,
+            Some(LayoutOptions {
+                rankdir: match self.layout_config.direction {
+                    LayoutDirection::TB => RankDir::TB,
+                    LayoutDirection::LR => RankDir::LR,
+                },
+                nodesep: self.layout_config.nodesep as f64,
+                ranksep: self.layout_config.ranksep as f64,
+                edgesep: self.layout_config.edgesep as f64,
+                marginx: self.layout_config.marginx as f64,
+                marginy: self.layout_config.marginy as f64,
+                ..Default::default()
+            }),
+        );
+
+        // The renderer positions everything relative to the canvas centre, so
+        // shift the whole diagram to be centred on the origin.
+        let mut raw: std::collections::HashMap<String, egui::Pos2> =
+            std::collections::HashMap::new();
+        let mut min = egui::pos2(f32::MAX, f32::MAX);
+        let mut max = egui::pos2(f32::MIN, f32::MIN);
+
+        let mut record = |name: &str, n: &NodeLabel| {
+            if let (Some(x), Some(y)) = (n.x, n.y) {
+                let p = egui::pos2(x as f32, y as f32);
+                raw.insert(name.to_string(), p);
+                min = egui::pos2(min.x.min(p.x), min.y.min(p.y));
+                max = egui::pos2(max.x.max(p.x), max.y.max(p.y));
+            }
+        };
+        for state in &fsm.states {
+            if let Some(n) = g.node(state.name.as_str()) {
+                record(&state.name, n);
+            }
+        }
+        if initial.is_some() {
+            if let Some(n) = g.node("[*]") {
+                record("[*]", n);
+            }
+        }
+        drop(record);
+
+        if raw.is_empty() {
+            self.state_positions.clear();
+            self.layout = Some(LayoutedDiagram::default());
+            return;
+        }
+        let centre = egui::vec2((min.x + max.x) * 0.5, (min.y + max.y) * 0.5);
+
+        self.state_positions.clear();
+        for (name, p) in &raw {
+            self.state_positions.insert(name.clone(), *p - centre);
+        }
+
+        let mut edges: Vec<LayoutedEdge> = Vec::new();
+        let mut labels: Vec<LayoutedLabel> = Vec::new();
+
+        for (index, source, target, name) in &edge_keys {
+            let Some(e) = g.edge(source.as_str(), target.as_str(), Some(name)) else {
+                continue;
+            };
+
+            let points: Vec<egui::Pos2> = e
+                .points
+                .iter()
+                .map(|p| egui::pos2(p.x as f32, p.y as f32) - centre)
+                .collect();
+            if points.len() < 2 {
                 continue;
             }
 
-            let transition_node_id = format!("__tr_{t_idx}");
+            let transition = &fsm.transitions[*index];
 
-            let raw_label = transition.label();
-            let label = format_label_text(&raw_label);
+            // "Reverse" means the target sits earlier along the rank direction,
+            // which is what the renderer colours differently.
+            let is_reverse = match (raw.get(source), raw.get(target)) {
+                (Some(a), Some(b)) => match self.layout_config.direction {
+                    LayoutDirection::TB => b.y < a.y,
+                    LayoutDirection::LR => b.x < a.x,
+                },
+                _ => false,
+            };
 
-            // Styling only (does NOT affect layout/routing)
-            let transition_type = {
-                let event_name = transition.event.as_ref().map(|e| e.name.to_lowercase()).unwrap_or_default();
-                if event_name.contains("timeout") || event_name.contains("timer") || event_name.contains("expired") {
-                    TransitionType::Timer
-                } else if transition.guard.is_some() {
-                    TransitionType::Conditional
-                } else {
-                    TransitionType::Forward
+            let text = transition.label();
+            if !text.is_empty() {
+                if let (Some(x), Some(y)) = (e.x, e.y) {
+                    labels.push(LayoutedLabel {
+                        pos: egui::pos2(x as f32, y as f32) - centre,
+                        text,
+                    });
                 }
-            };
-
-            transition_node_type.insert(transition_node_id.clone(), transition_type);
-
-            if label.is_empty() {
-                nodes_in.push(JsNodeIn {
-                    id: transition_node_id.clone(),
-                    width: 1.0,
-                    height: 1.0,
-                });
-            } else {
-                let label_size = Self::measure_text(ctx, &label, self.layout_config.edge_label_font_size);
-                nodes_in.push(JsNodeIn {
-                    id: transition_node_id.clone(),
-                    width: label_size.x + 14.0,
-                    height: label_size.y + 8.0,
-                });
-                label_node_text.insert(transition_node_id.clone(), label);
             }
 
-            edges_in.push(JsEdgeIn {
-                v: transition.source.clone(),
-                w: transition_node_id.clone(),
-                name: Some(format!("tr_{t_idx}_a")),
-                label_width: Some(0.0),
-                label_height: Some(0.0),
-            });
-            edges_in.push(JsEdgeIn {
-                v: transition_node_id.clone(),
-                w: transition.target.clone(),
-                name: Some(format!("tr_{t_idx}_b")),
-                label_width: Some(0.0),
-                label_height: Some(0.0),
+            edges.push(LayoutedEdge {
+                v: source.clone(),
+                w: target.clone(),
+                transition_index: Some(*index),
+                points,
+                transition_type: classify_transition(transition, is_reverse),
             });
         }
 
-        let input = JsLayoutInput {
-            graph: graph_cfg,
-            nodes: nodes_in,
-            edges: edges_in,
-        };
-
-        // Run JS Dagre (requires `npm install` in tools/dagre-svg-demo).
-        let demo_dir = dagre_demo_dir();
-        let script = demo_dir.join("src/layout_json.mjs");
-        if !script.exists() {
-            return Err(format!(
-                "Dagre layout script not found at: {}\n\nThis usually means the bundled resources are missing.\n\nDev: ensure tools/dagre-svg-demo exists.\nPackaged: ensure tools/dagre-svg-demo is shipped alongside the app (or set OXIDATE_DAGRE_DIR).",
-                script.display()
-            ));
-        }
-        let input_json = serde_json::to_vec(&input).map_err(|e| format!("Failed to serialize layout input: {e}"))?;
-
-        let node = node_binary();
-        let mut child = Command::new(&node)
-            .current_dir(&demo_dir)
-            .arg(script)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                format!(
-                    "Failed to spawn Node.js ({}): {e}\n\nIf Node is not installed, install it OR bundle it and set OXIDATE_NODE.\nAlso run: `cd tools/dagre-svg-demo && npm install` (or ship node_modules in releases).",
-                    node.display()
-                )
-            })?;
-
-        {
-            let stdin = child.stdin.as_mut().ok_or_else(|| "Failed to open stdin for Node.js".to_string())?;
-            stdin
-                .write_all(&input_json)
-                .map_err(|e| format!("Failed to write to Node.js stdin: {e}"))?;
-        }
-
-        let output = child
-            .wait_with_output()
-            .map_err(|e| format!("Failed to wait for Node.js: {e}"))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(format!(
-                "Dagre (Node.js) layout failed.\n\nIf you haven't yet, run: `cd tools/dagre-svg-demo && npm install`\n\nError:\n{}",
-                stderr.trim()
-            ));
-        }
-
-        let js_layout: JsLayoutOutput = serde_json::from_slice(&output.stdout)
-            .map_err(|e| format!("Failed to parse Dagre output JSON: {e}"))?;
-
-        // Compute center using returned nodes/edge points.
-        let mut min_x = f32::INFINITY;
-        let mut min_y = f32::INFINITY;
-        let mut max_x = f32::NEG_INFINITY;
-        let mut max_y = f32::NEG_INFINITY;
-
-        for n in js_layout.nodes.values() {
-            min_x = min_x.min(n.x - n.width * 0.5);
-            max_x = max_x.max(n.x + n.width * 0.5);
-            min_y = min_y.min(n.y - n.height * 0.5);
-            max_y = max_y.max(n.y + n.height * 0.5);
-        }
-        for e in &js_layout.edges {
-            for p in &e.points {
-                min_x = min_x.min(p.x);
-                max_x = max_x.max(p.x);
-                min_y = min_y.min(p.y);
-                max_y = max_y.max(p.y);
-            }
-        }
-        if !min_x.is_finite() {
-            min_x = 0.0;
-            min_y = 0.0;
-            max_x = 0.0;
-            max_y = 0.0;
-        }
-        let center = egui::vec2((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
-
-        self.state_positions.clear();
-        for (id, n) in js_layout.nodes.iter() {
-            self.state_positions.insert(id.clone(), egui::pos2(n.x - center.x, n.y - center.y));
-        }
-
-        let mut layout_edges: Vec<LayoutedEdge> = Vec::new();
-        for e in &js_layout.edges {
-            let transition_type = if e.v.starts_with("__tr_") {
-                transition_node_type.get(&e.v).copied().unwrap_or(TransitionType::Forward)
-            } else if e.w.starts_with("__tr_") {
-                transition_node_type.get(&e.w).copied().unwrap_or(TransitionType::Forward)
-            } else {
-                TransitionType::Forward
-            };
-
-            let transition_index = e
-                .name
-                .as_deref()
-                .and_then(|name| name.strip_prefix("tr_"))
-                .and_then(|rest| rest.split('_').next())
-                .and_then(|n| n.parse::<usize>().ok());
-
-            layout_edges.push(LayoutedEdge {
-                v: e.v.clone(),
-                w: e.w.clone(),
-                transition_index,
-                points: e.points.iter().map(|p| egui::pos2(p.x - center.x, p.y - center.y)).collect(),
-                transition_type,
-            });
-        }
-
-        let mut layout_labels: Vec<LayoutedLabel> = Vec::new();
-        for (label_node_id, text) in label_node_text.iter() {
-            if let Some(n) = js_layout.nodes.get(label_node_id) {
-                layout_labels.push(LayoutedLabel {
-                    pos: egui::pos2(n.x - center.x, n.y - center.y),
-                    text: text.clone(),
-                });
+        if let Some(target) = initial.as_ref() {
+            if let Some(e) = g.edge("[*]", target.as_str(), Some(&"__initial".to_string())) {
+                let points: Vec<egui::Pos2> = e
+                    .points
+                    .iter()
+                    .map(|p| egui::pos2(p.x as f32, p.y as f32) - centre)
+                    .collect();
+                if points.len() >= 2 {
+                    edges.push(LayoutedEdge {
+                        v: "[*]".to_string(),
+                        w: target.clone(),
+                        transition_index: None,
+                        points,
+                        transition_type: TransitionType::Forward,
+                    });
+                }
             }
         }
 
-        self.layout = Some(LayoutedDiagram { edges: layout_edges, labels: layout_labels });
-        Ok(())
+        self.layout = Some(LayoutedDiagram { edges, labels });
     }
 
     fn calculate_state_positions(&mut self) {
@@ -831,7 +698,7 @@ impl OxidateApp {
                     *level_counts.entry(*level).or_insert(0) += 1;
                 }
                 
-                let max_level = levels.values().max().copied().unwrap_or(0);
+                let _max_level = levels.values().max().copied().unwrap_or(0);
                 let mut level_current: std::collections::HashMap<i32, i32> = std::collections::HashMap::new();
                 
                 for (state_name, level) in &levels {
@@ -856,6 +723,7 @@ impl OxidateApp {
     }
     
     /// Apply force-directed layout adjustment
+    #[allow(dead_code)]
     fn apply_force_layout(&mut self, levels: &std::collections::HashMap<String, i32>, min_x: f32, min_y: f32) {
         let iterations = 100;
         let repulsion = 15000.0;
@@ -1123,8 +991,20 @@ fsm {name} {{
     fn sim_reset_to_initial(&mut self, fsm: &FsmDefinition) {
         self.sim.queued_events.clear();
         self.sim.auto_accum_s = 0.0;
+        self.sim.auto_cursor = 0;
         self.sim.last_fired = None;
         self.sim.last_frame = None;
+
+        // Offer a sequence that actually drives *this* machine. Only when the
+        // field is untouched, so a sequence the user typed is never clobbered.
+        let suggested = Self::suggest_event_sequence(fsm);
+        if !suggested.is_empty()
+            && (self.sim.auto_event.trim().is_empty()
+                || self.sim.auto_event == self.sim.suggested_events)
+        {
+            self.sim.auto_event = suggested.clone();
+        }
+        self.sim.suggested_events = suggested;
 
         if let Some(initial) = &fsm.initial_state {
             self.sim.current_state = Some(initial.clone());
@@ -1440,18 +1320,11 @@ impl eframe::App for OxidateApp {
         // Engine-driven layout recomputation (FSM → Graph → Dagre → Renderer)
         if self.layout_dirty {
             if let Some(fsm) = self.fsms.get(self.selected_fsm).cloned() {
-                match self.compute_layout_with_dagre(ctx, &fsm) {
-                    Ok(()) => {
-                        // Keep parse errors (if any) intact; only clear layout-related errors.
-                        if let Some(msg) = &self.error_message {
-                            if msg.starts_with("Layout error:") {
-                                self.error_message = None;
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        self.error_message = Some(format!("Layout error: {e}"));
-                        self.layout = None;
+                self.compute_layout_native(&fsm);
+                // Keep parse errors (if any) intact; only clear layout-related errors.
+                if let Some(msg) = &self.error_message {
+                    if msg.starts_with("Layout error:") {
+                        self.error_message = None;
                     }
                 }
             }
@@ -1735,7 +1608,7 @@ impl eframe::App for OxidateApp {
                 ui.separator();
                 ui.label("Layout:");
                 let mut dir_changed = false;
-                egui::ComboBox::from_id_source("layout_direction")
+                egui::ComboBox::from_id_salt("layout_direction")
                     .selected_text(match self.layout_config.direction {
                         LayoutDirection::TB => "TB",
                         LayoutDirection::LR => "LR",
@@ -1778,21 +1651,39 @@ impl eframe::App for OxidateApp {
                     });
 
                     ui.horizontal(|ui| {
-                        ui.label("Event:");
-                        ui.text_edit_singleline(&mut self.sim.event_input);
+                        ui.label("Manual");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.sim.event_input)
+                                .desired_width(340.0)
+                                .hint_text("one event name, then press Post"),
+                        );
                         if ui.button("Post").clicked() {
                             let ev = self.sim.event_input.trim().to_string();
                             self.sim_post_event(ev);
                             self.sim.event_input.clear();
                         }
-                        ui.separator();
-                        ui.checkbox(&mut self.sim.auto_tick, "Auto");
-                        ui.add(egui::DragValue::new(&mut self.sim.auto_period_s).speed(0.1).clamp_range(0.1..=10.0).prefix("period ").suffix("s"));
-                        ui.label("event");
-                        ui.text_edit_singleline(&mut self.sim.auto_event);
                         if ui.button("Clear log").clicked() {
                             self.sim.log.clear();
                         }
+                    });
+
+                    // The auto-driver gets its own row, with the text field at
+                    // the same width as the manual one so the two read as a
+                    // pair rather than as one wrapped line.
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.sim.auto_tick, "Auto");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.sim.auto_event)
+                                .desired_width(340.0)
+                                .hint_text("event1, event2, … cycled while running"),
+                        );
+                        ui.label("every");
+                        ui.add(
+                            egui::DragValue::new(&mut self.sim.auto_period_s)
+                                .speed(0.1)
+                                .range(0.1..=10.0)
+                                .suffix("s"),
+                        );
                     });
 
                     // Per-frame sim update (auto event + stepping).
@@ -1809,8 +1700,17 @@ impl eframe::App for OxidateApp {
                             self.sim.auto_accum_s += dt_s;
                             while self.sim.auto_accum_s >= self.sim.auto_period_s {
                                 self.sim.auto_accum_s -= self.sim.auto_period_s;
-                                let ev = self.sim.auto_event.trim().to_string();
-                                if !ev.is_empty() {
+                                let sequence: Vec<String> = self
+                                    .sim
+                                    .auto_event
+                                    .split(',')
+                                    .map(|e| e.trim().to_string())
+                                    .filter(|e| !e.is_empty())
+                                    .collect();
+                                if !sequence.is_empty() {
+                                    let ev = sequence[self.sim.auto_cursor % sequence.len()].clone();
+                                    self.sim.auto_cursor =
+                                        (self.sim.auto_cursor + 1) % sequence.len();
                                     self.sim_post_event(ev);
                                 }
                             }
@@ -2033,6 +1933,7 @@ struct LabelInfo {
 
 /// Information about a state box for collision detection
 #[derive(Clone)]
+#[allow(dead_code)] // superseded by the dagre crate; kept for reference
 struct StateBox {
     rect: egui::Rect,
 }
@@ -2343,6 +2244,7 @@ fn classify_transition(transition: &fsm::Transition, is_reverse: bool) -> Transi
 /// - Exit transitions: label on RIGHT  
 /// - Timer events: label ABOVE
 /// - All labels have large offset from arrows
+#[allow(dead_code)] // superseded by the dagre crate; kept for reference
 fn calculate_label_position(
     route: &[egui::Pos2], 
     offset_index: i32, 
@@ -2472,6 +2374,7 @@ fn format_label_text(label: &str) -> String {
 }
 
 /// Calculate label info for orthogonal transition
+#[allow(dead_code)] // superseded by the dagre crate; kept for reference
 fn calculate_label_info_orthogonal(
     route: &[egui::Pos2],
     transition: &fsm::Transition,
@@ -2517,12 +2420,14 @@ fn calculate_label_info_orthogonal(
 }
 
 /// Check if two rectangles overlap with margin
+#[allow(dead_code)] // superseded by the dagre crate; kept for reference
 fn rects_overlap_with_margin(a: &egui::Rect, b: &egui::Rect, margin: f32) -> bool {
     let a_expanded = a.expand(margin);
     a_expanded.intersects(*b)
 }
 
 /// Calculate overlap depth between two rectangles
+#[allow(dead_code)] // superseded by the dagre crate; kept for reference
 fn overlap_depth(a: &egui::Rect, b: &egui::Rect) -> f32 {
     if !a.intersects(*b) {
         return 0.0;
@@ -2535,6 +2440,7 @@ fn overlap_depth(a: &egui::Rect, b: &egui::Rect) -> f32 {
 }
 
 /// Resolve overlapping labels - considers both other labels AND state boxes
+#[allow(dead_code)] // superseded by the dagre crate; kept for reference
 fn resolve_label_overlaps(labels: &mut [LabelInfo], state_boxes: &[StateBox]) {
     if labels.is_empty() {
         return;
@@ -2625,6 +2531,7 @@ fn resolve_label_overlaps(labels: &mut [LabelInfo], state_boxes: &[StateBox]) {
 }
 
 /// Draw orthogonal arrow with arrowhead
+#[allow(dead_code)] // superseded by the dagre crate; kept for reference
 fn draw_orthogonal_arrow(painter: &egui::Painter, route: &[egui::Pos2], zoom: f32) {
     draw_orthogonal_arrow_colored(painter, route, zoom, egui::Color32::from_rgb(160, 175, 195));
 }

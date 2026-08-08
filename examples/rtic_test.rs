@@ -440,6 +440,8 @@ struct TestMotorActions {
     last_sensor_value: Rc<RefCell<u32>>,
 }
 
+// Helper methods kept for illustration; not every one is exercised here.
+#[allow(dead_code)]
 impl TestMotorActions {
     fn new() -> Self {
         Self {

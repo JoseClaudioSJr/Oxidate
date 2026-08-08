@@ -135,6 +135,8 @@ struct TestDoorActions {
     log: Rc<RefCell<Vec<String>>>,
 }
 
+// Helper methods kept for illustration; not every one is exercised here.
+#[allow(dead_code)]
 impl TestDoorActions {
     fn new(log: Rc<RefCell<Vec<String>>>) -> Self {
         Self {
@@ -312,7 +314,7 @@ fn main() {
     println!("Door Lock FSM - Guards and Actions Example\n");
     
     let log = Rc::new(RefCell::new(Vec::new()));
-    let mut actions = TestDoorActions::new(log.clone());
+    let actions = TestDoorActions::new(log.clone());
     
     // First try with invalid code
     let mut fsm = DoorFsm::new(actions);

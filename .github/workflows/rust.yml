@@ -40,6 +40,10 @@ jobs:
 
       - name: Run tests (default features)
         run: cargo test
+        env:
+          RUSTFLAGS: -D warnings
 
       - name: Run tests (no default features)
         run: cargo test --no-default-features
+        env:
+          RUSTFLAGS: -D warnings
