@@ -712,3 +712,102 @@ fn test_usage_doc_warns_about_dropped_events() {
     let code = generate(CONNECTION_MANAGER);
     assert!(code.contains("silently ignores an event with no transition"));
 }
+
+#[test]
+fn test_action_named_after_a_keyword_is_rejected() {
+    // Produced `fn match(&mut self);`, which is not valid Rust.
+    let errors = expect_errors(
+        r#"
+        fsm Probe {
+            [*] --> A
+            state A
+            state B
+            A --> B : Go / match()
+        }
+    "#,
+    );
+
+    assert!(
+        errors.iter().any(|e| e.contains("'match'") && e.contains("keyword")),
+        "expected a keyword error, got {errors:?}"
+    );
+}
+
+#[test]
+fn test_self_is_rejected_everywhere_it_appears() {
+    // `Self` survives both case conversions: to_pascal_case leaves it alone and
+    // to_snake_case yields `self`. Both are reserved.
+    for source in [
+        r#"fsm Probe { [*] --> A state A state Self A --> Self : Go }"#,
+        r#"fsm Probe { [*] --> A state A state B A --> B : Self }"#,
+    ] {
+        let errors = expect_errors(source);
+        assert!(
+            errors.iter().any(|e| e.contains("Self") && e.contains("keyword")),
+            "expected Self to be rejected, got {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn test_fsm_named_after_the_type_parameter_is_rejected() {
+    // `pub struct Ctx<Ctx: CtxActions>` shadows its own parameter.
+    let errors = expect_errors(
+        r#"
+        fsm Ctx {
+            [*] --> A
+            state A
+            state B
+            A --> B : Go
+        }
+    "#,
+    );
+
+    assert!(
+        errors.iter().any(|e| e.contains("type parameter")),
+        "expected a type parameter collision, got {errors:?}"
+    );
+}
+
+#[test]
+fn test_single_letter_fsm_name_still_works() {
+    // `fsm T` used to emit `impl<T: TActions> T<T>`. Renaming the generated
+    // parameter to `Ctx` fixed it; this guards the fix.
+    let code = generate(
+        r#"
+        fsm T {
+            [*] --> A
+            state A
+            state B
+            A --> B : Go
+        }
+    "#,
+    );
+
+    assert!(code.contains("pub struct T<Ctx: TActions> {"));
+    assert!(code.contains("impl<Ctx: TActions> T<Ctx> {"));
+}
+
+#[test]
+fn test_ordinary_names_are_not_rejected() {
+    // The keyword check must not be over-eager: `Match` and `Type` are fine as
+    // enum variants, since to_pascal_case capitalises them.
+    let fsms = parse_fsm(
+        r#"
+        fsm Probe {
+            [*] --> Idle
+            state Idle
+            state Match
+            state Type
+            Idle --> Match : Go / do_match()
+            Match --> Type : Next
+        }
+    "#,
+    )
+    .expect("Should parse");
+
+    assert!(
+        generate_rust_code(&fsms[0]).is_ok(),
+        "valid names were rejected"
+    );
+}

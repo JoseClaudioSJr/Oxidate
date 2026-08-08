@@ -163,10 +163,61 @@ fn validate_for_codegen(fsm: &FsmDefinition) -> Result<(), CodegenErrors> {
         &mut errors,
     );
 
+    // Uniqueness is not enough: the identifier also has to be legal Rust.
+    check_identifiers_are_legal(fsm, &mut errors);
+
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
+    }
+}
+
+/// Rejects names whose generated identifier is not a valid Rust identifier.
+///
+/// The collision checks above compare names against each other; this compares
+/// each generated identifier against the language. An action called `match`
+/// yields `fn match(&mut self)`, and anything called `Self` survives both case
+/// conversions — neither compiles.
+fn check_identifiers_are_legal(fsm: &FsmDefinition, errors: &mut CodegenErrors) {
+    // The struct is `Foo<Ctx: FooActions>`, so an FSM named `Ctx` would shadow
+    // its own type parameter.
+    if to_pascal_case(&fsm.name) == CONTEXT_TYPE_PARAM {
+        errors.push(format!(
+            "fsm '{}' collides with the generated type parameter '{CONTEXT_TYPE_PARAM}'",
+            fsm.name
+        ));
+    }
+
+    let mut report = |kind: &str, name: &str, generated: &str, produces: &str| {
+        if is_rust_keyword(generated) {
+            errors.push(format!(
+                "{kind} '{name}' generates the {produces} '{generated}', which is a Rust keyword"
+            ));
+        }
+    };
+
+    for state in &fsm.states {
+        report("state", &state.name, &to_pascal_case(&state.name), "enum variant");
+    }
+
+    for transition in fsm
+        .transitions
+        .iter()
+        .chain(fsm.states.iter().flat_map(|s| s.internal_transitions.iter()))
+    {
+        if let Some(event) = &transition.event {
+            report("event", &event.name, &to_pascal_case(&event.name), "enum variant");
+        }
+        if let Some(action) = &transition.action {
+            report("action", &action.name, &to_snake_case(&action.name), "trait method");
+        }
+    }
+
+    for state in &fsm.states {
+        for action in state.entry_actions.iter().chain(state.exit_actions.iter()) {
+            report("action", &action.name, &to_snake_case(&action.name), "trait method");
+        }
     }
 }
 
@@ -716,9 +767,12 @@ fn generate_event_enum(fsm: &FsmDefinition) -> String {
 fn generate_fsm_struct(fsm: &FsmDefinition) -> String {
     let mut code = String::new();
     
-    code.push_str(&format!("pub struct {}<T: {}Actions> {{\n", fsm.name, fsm.name));
+    code.push_str(&format!(
+        "pub struct {}<{CONTEXT_TYPE_PARAM}: {}Actions> {{\n",
+        fsm.name, fsm.name
+    ));
     code.push_str(&format!("    state: {}State,\n", fsm.name));
-    code.push_str("    context: T,\n");
+    code.push_str(&format!("    context: {CONTEXT_TYPE_PARAM},\n"));
     code.push_str("}\n");
     
     code
@@ -731,10 +785,13 @@ fn generate_fsm_impl(fsm: &FsmDefinition) -> String {
         .map(|s| to_pascal_case(s))
         .unwrap_or_else(|| "Unknown".to_string());
     
-    code.push_str(&format!("impl<T: {}Actions> {}<T> {{\n", fsm.name, fsm.name));
+    code.push_str(&format!(
+        "impl<{CONTEXT_TYPE_PARAM}: {}Actions> {}<{CONTEXT_TYPE_PARAM}> {{\n",
+        fsm.name, fsm.name
+    ));
     
     // Constructor
-    code.push_str("    pub fn new(context: T) -> Self {\n");
+    code.push_str(&format!("    pub fn new(context: {CONTEXT_TYPE_PARAM}) -> Self {{\n"));
     code.push_str(&format!("        Self {{\n"));
     code.push_str(&format!("            state: {}State::{},\n", fsm.name, initial_state));
     code.push_str("            context,\n");
@@ -747,12 +804,12 @@ fn generate_fsm_impl(fsm: &FsmDefinition) -> String {
     code.push_str("    }\n\n");
     
     // Context getter
-    code.push_str("    pub fn context(&self) -> &T {\n");
+    code.push_str(&format!("    pub fn context(&self) -> &{CONTEXT_TYPE_PARAM} {{\n"));
     code.push_str("        &self.context\n");
     code.push_str("    }\n\n");
     
     // Context mutable getter
-    code.push_str("    pub fn context_mut(&mut self) -> &mut T {\n");
+    code.push_str(&format!("    pub fn context_mut(&mut self) -> &mut {CONTEXT_TYPE_PARAM} {{\n"));
     code.push_str("        &mut self.context\n");
     code.push_str("    }\n\n");
     
@@ -1068,6 +1125,35 @@ fn final_variant_name(fsm: &FsmDefinition) -> String {
     name
 }
 
+/// Whether `word` cannot be used as a Rust identifier.
+///
+/// Covers strict and reserved keywords for the 2015, 2018 and 2021 editions,
+/// plus the weak ones — `union` and `'static` are contextual, but a generated
+/// method named `union` is confusing enough to be worth rejecting too.
+fn is_rust_keyword(word: &str) -> bool {
+    const KEYWORDS: &[&str] = &[
+        // strict
+        "as", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false",
+        "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+        "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true", "type",
+        "unsafe", "use", "where", "while",
+        // strict, 2018+
+        "async", "await",
+        // reserved for future use
+        "abstract", "become", "box", "do", "final", "macro", "override", "priv", "typeof",
+        "unsized", "virtual", "yield", "try",
+        // weak / contextual
+        "union",
+    ];
+    KEYWORDS.contains(&word)
+}
+
+/// Name of the generic parameter in the generated struct and impl.
+///
+/// Deliberately not `T`: an FSM named `T` produced `impl<T: TActions> T<T>`,
+/// which does not compile. `Ctx` also reads better at the call site.
+const CONTEXT_TYPE_PARAM: &str = "Ctx";
+
 /// Turns a guard expression into a valid Rust identifier for the actions trait.
 ///
 /// A guard is written as a free-form expression in the DSL (`[attempts > 3]`,
@@ -1119,13 +1205,7 @@ fn to_guard_ident(expr: &str) -> String {
     }
 
     // Avoid colliding with a Rust keyword.
-    const KEYWORDS: &[&str] = &[
-        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
-        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
-        "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe", "use",
-        "where", "while", "async", "await", "dyn",
-    ];
-    if KEYWORDS.contains(&ident.as_str()) {
+    if is_rust_keyword(&ident) {
         ident.push('_');
     }
 
