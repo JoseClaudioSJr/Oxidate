@@ -491,12 +491,17 @@ impl OxidateApp {
                 continue; // endpoint not laid out (e.g. a choice point)
             }
 
-            let text = transition.label();
+            // Break long labels across lines: the event on one line, the guard
+            // on the next. Narrower labels leave the layout more room to work
+            // with, and dagre needs the size to reserve space for them.
+            let text = format_label_text(&transition.label());
             let mut label = EdgeLabel::default();
             if !text.is_empty() {
                 let font = self.layout_config.edge_label_font_size as f64;
-                label.width = text.chars().count() as f64 * font * 0.55;
-                label.height = font * 1.6;
+                let widest = text.lines().map(|l| l.chars().count()).max().unwrap_or(0);
+                let line_count = text.lines().count().max(1);
+                label.width = widest as f64 * font * 0.55;
+                label.height = line_count as f64 * font * 1.6;
             }
 
             let name = format!("tr_{index}");
@@ -609,7 +614,7 @@ impl OxidateApp {
                 _ => false,
             };
 
-            let text = transition.label();
+            let text = format_label_text(&transition.label());
             if !text.is_empty() {
                 if let (Some(x), Some(y)) = (e.x, e.y) {
                     labels.push(LayoutedLabel {
