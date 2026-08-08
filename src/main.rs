@@ -2625,3 +2625,231 @@ fsm VendingMachine {
     ReturningChange --> Idle : change_returned
 }
 "#;
+
+#[cfg(test)]
+mod layout_tests {
+    //! Properties the edge routes must hold.
+    //!
+    //! Fixtures are real `dagre` output for `examples/door_lock.fsm`, captured by
+    //! running the layout and printing the raw points. Keeping actual output here
+    //! means these test the pipeline against the shapes dagre really produces,
+    //! not against shapes invented to be convenient.
+
+    use super::*;
+    use std::collections::HashMap;
+
+    const EPS: f32 = 0.6;
+
+    /// Nodes are 180x70, all centred at x=156.5.
+    fn door_lock_boxes() -> HashMap<String, egui::Rect> {
+        let mut boxes = HashMap::new();
+        for (name, y) in [
+            ("Locked", 35.0),
+            ("Unlocked", 215.0),
+            ("Open", 395.0),
+            ("Alarming", 575.0),
+        ] {
+            boxes.insert(
+                name.to_string(),
+                egui::Rect::from_center_size(egui::pos2(156.5, y), egui::vec2(180.0, 70.0)),
+            );
+        }
+        boxes
+    }
+
+    fn door_lock_routes() -> Vec<(&'static str, &'static str, Vec<egui::Pos2>)> {
+        vec![
+            ("Locked", "Unlocked", vec![
+                egui::pos2(179.0, 70.0), egui::pos2(214.0, 125.0), egui::pos2(179.0, 180.0)]),
+            ("Locked", "Alarming", vec![
+                egui::pos2(231.0, 70.0), egui::pos2(348.0, 125.0), egui::pos2(348.0, 215.0),
+                egui::pos2(348.0, 305.0), egui::pos2(348.0, 395.0), egui::pos2(348.0, 485.0),
+                egui::pos2(231.0, 540.0)]),
+            ("Unlocked", "Locked", vec![
+                egui::pos2(121.0, 180.0), egui::pos2(65.0, 125.0), egui::pos2(121.0, 70.0)]),
+            ("Unlocked", "Open", vec![
+                egui::pos2(176.0, 250.0), egui::pos2(207.0, 305.0), egui::pos2(176.0, 360.0)]),
+            ("Open", "Unlocked", vec![
+                egui::pos2(137.0, 360.0), egui::pos2(106.0, 305.0), egui::pos2(137.0, 250.0)]),
+            ("Open", "Alarming", vec![
+                egui::pos2(156.0, 430.0), egui::pos2(156.0, 485.0), egui::pos2(156.0, 540.0)]),
+            ("Alarming", "Locked", vec![
+                egui::pos2(92.0, 540.0), egui::pos2(-10.0, 485.0), egui::pos2(-10.0, 395.0),
+                egui::pos2(-10.0, 305.0), egui::pos2(-10.0, 215.0), egui::pos2(-10.0, 125.0),
+                egui::pos2(92.0, 70.0)]),
+        ]
+    }
+
+    /// The same sequence `compute_layout_native` applies to dagre's output.
+    fn routed() -> (HashMap<String, egui::Rect>, Vec<LayoutedEdge>) {
+        let boxes = door_lock_boxes();
+        let mut edges = Vec::new();
+        for (i, (v, w, raw)) in door_lock_routes().into_iter().enumerate() {
+            let squared = orthogonalise(&raw, LayoutDirection::TB, i);
+            let clipped = clip_route_to_boxes(&squared, boxes[v], boxes[w]);
+            edges.push(LayoutedEdge {
+                v: v.to_string(),
+                w: w.to_string(),
+                transition_index: Some(i),
+                points: clipped,
+                transition_type: TransitionType::Forward,
+            });
+        }
+        distribute_endpoints(&mut edges, &boxes);
+        (boxes, edges)
+    }
+
+    fn on_border(p: egui::Pos2, r: egui::Rect) -> bool {
+        let vertical_edge = (p.x - r.left()).abs() < EPS || (p.x - r.right()).abs() < EPS;
+        let horizontal_edge = (p.y - r.top()).abs() < EPS || (p.y - r.bottom()).abs() < EPS;
+        let within_y = p.y >= r.top() - EPS && p.y <= r.bottom() + EPS;
+        let within_x = p.x >= r.left() - EPS && p.x <= r.right() + EPS;
+        (vertical_edge && within_y) || (horizontal_edge && within_x)
+    }
+
+    #[test]
+    fn every_segment_is_axis_aligned() {
+        // No 45-degree runs: each segment moves in x or in y, never both.
+        let (_, edges) = routed();
+        for edge in &edges {
+            for pair in edge.points.windows(2) {
+                let diagonal =
+                    (pair[1].x - pair[0].x).abs() > EPS && (pair[1].y - pair[0].y).abs() > EPS;
+                assert!(
+                    !diagonal,
+                    "{} -> {} has a diagonal segment {:?} -> {:?}",
+                    edge.v, edge.w, pair[0], pair[1]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn endpoints_sit_on_the_box_borders() {
+        // Arrowheads stopping short of a state, or buried inside it, were the
+        // most visible routing defect.
+        let (boxes, edges) = routed();
+        for edge in &edges {
+            let first = edge.points[0];
+            let last = edge.points[edge.points.len() - 1];
+            assert!(
+                on_border(first, boxes[&edge.v]),
+                "{} -> {} leaves from {:?}, not on the source border",
+                edge.v, edge.w, first
+            );
+            assert!(
+                on_border(last, boxes[&edge.w]),
+                "{} -> {} arrives at {:?}, not on the target border",
+                edge.v, edge.w, last
+            );
+        }
+    }
+
+    #[test]
+    fn no_zero_length_segments() {
+        // A degenerate final segment makes the arrowhead point nowhere.
+        let (_, edges) = routed();
+        for edge in &edges {
+            for pair in edge.points.windows(2) {
+                assert!(
+                    (pair[1] - pair[0]).length() > EPS,
+                    "{} -> {} has a zero-length segment at {:?}",
+                    edge.v, edge.w, pair[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn routes_do_not_cut_through_unrelated_boxes() {
+        let (boxes, edges) = routed();
+        for edge in &edges {
+            for (name, rect) in &boxes {
+                if *name == edge.v || *name == edge.w {
+                    continue;
+                }
+                // Touching a border is fine; passing through the interior is not.
+                let interior = egui::Rect::from_min_max(
+                    egui::pos2(rect.left() + 2.0, rect.top() + 2.0),
+                    egui::pos2(rect.right() - 2.0, rect.bottom() - 2.0),
+                );
+                for p in &edge.points {
+                    assert!(
+                        !interior.contains(*p),
+                        "{} -> {} passes through {}",
+                        edge.v, edge.w, name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn label_anchors_lie_on_their_route() {
+        // The anchor used to come from dagre and referred to the diagonal route
+        // that no longer exists after squaring off.
+        let (_, edges) = routed();
+        for edge in &edges {
+            let anchor = label_anchor(&edge.points);
+            let on_route = edge.points.windows(2).any(|pair| {
+                let (a, b) = (pair[0], pair[1]);
+                let inside = anchor.x >= a.x.min(b.x) - EPS
+                    && anchor.x <= a.x.max(b.x) + EPS
+                    && anchor.y >= a.y.min(b.y) - EPS
+                    && anchor.y <= a.y.max(b.y) + EPS;
+                let aligned = ((b.x - a.x).abs() < EPS && (anchor.x - a.x).abs() < EPS)
+                    || ((b.y - a.y).abs() < EPS && (anchor.y - a.y).abs() < EPS);
+                inside && aligned
+            });
+            assert!(on_route, "{} -> {} label anchor {:?} is off the route", edge.v, edge.w, anchor);
+        }
+    }
+
+    #[test]
+    fn endpoints_on_one_side_stay_apart() {
+        let (boxes, edges) = routed();
+        let mut per_side: HashMap<(String, BoxSide), Vec<f32>> = HashMap::new();
+        for edge in &edges {
+            let last = edge.points[edge.points.len() - 1];
+            let rect = boxes[&edge.w];
+            let side = side_of(last, rect);
+            let along = match side {
+                BoxSide::Top | BoxSide::Bottom => last.x,
+                BoxSide::Left | BoxSide::Right => last.y,
+            };
+            per_side.entry((edge.w.clone(), side)).or_default().push(along);
+        }
+        for (key, mut coords) in per_side {
+            if coords.len() < 2 {
+                continue;
+            }
+            coords.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let gap = coords.windows(2).map(|c| c[1] - c[0]).fold(f32::MAX, f32::min);
+            assert!(gap > 8.0, "{key:?}: endpoints only {gap:.1}px apart");
+        }
+    }
+
+    #[test]
+    fn self_loop_is_closed_orthogonal_and_clear_of_the_state() {
+        // A multi-line label used to spill back over the box it belonged to.
+        let rect = egui::Rect::from_center_size(egui::pos2(0.0, 0.0), egui::vec2(180.0, 70.0));
+        for text in ["short", "coin\ninserted / add\ncoin"] {
+            let label_w = label_box_width(text, 12.0);
+            let reach = rect.right() + 20.0 + label_w;
+            let points = self_loop_route(rect, reach);
+
+            for pair in points.windows(2) {
+                let diagonal =
+                    (pair[1].x - pair[0].x).abs() > EPS && (pair[1].y - pair[0].y).abs() > EPS;
+                assert!(!diagonal, "self-loop segment is diagonal for {text:?}");
+            }
+            assert!((points[0].x - rect.right()).abs() < EPS);
+            assert!((points[points.len() - 1].x - rect.right()).abs() < EPS);
+
+            let label_pos = egui::pos2(rect.right() + 10.0 + label_w * 0.5, rect.center().y);
+            let label_rect = egui::Rect::from_center_size(label_pos, egui::vec2(label_w, 40.0));
+            assert!(!label_rect.intersects(rect), "self-loop label overlaps the state for {text:?}");
+            assert!(reach >= label_rect.right(), "self-loop does not enclose its label for {text:?}");
+        }
+    }
+}
