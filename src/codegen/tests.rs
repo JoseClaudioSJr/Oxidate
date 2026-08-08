@@ -1114,3 +1114,81 @@ fn test_a_position_used_with_both_kinds_becomes_a_string() {
     assert!(code.contains(r#"self.context.mark("1");"#));
     assert!(code.contains(r#"self.context.mark("start");"#));
 }
+
+#[test]
+fn test_start_runs_the_initial_state_entry_actions() {
+    // Entry actions are emitted in the transition arms that enter a state, and
+    // nothing transitions into the initial one — `new` only assigns the field.
+    // So `entry / display_welcome()` on the initial state never ran.
+    let code = generate(
+        r#"
+        fsm Probe {
+            [*] --> Idle
+            state Idle { entry / display_welcome() entry / arm(watchdog) }
+            state Busy
+            Idle --> Busy : Go
+        }
+    "#,
+    );
+
+    let start = code
+        .split("pub fn start(&mut self) {")
+        .nth(1)
+        .expect("no start method");
+    let start = start.split("\n    }").next().unwrap();
+
+    assert!(start.contains("self.context.display_welcome();"));
+    assert!(start.contains(r#"self.context.arm("watchdog");"#));
+}
+
+#[test]
+fn test_new_has_no_side_effects() {
+    // Construction stays free of side effects: on an embedded target the machine
+    // is often built before the peripherals its actions drive are ready.
+    let code = generate(
+        r#"
+        fsm Probe {
+            [*] --> Idle
+            state Idle { entry / display_welcome() }
+            state Busy
+            Idle --> Busy : Go
+        }
+    "#,
+    );
+
+    let new = code
+        .split("pub fn new(context: Ctx) -> Self {")
+        .nth(1)
+        .expect("no constructor");
+    let new = new.split("\n    }").next().unwrap();
+
+    assert!(
+        !new.contains("self.context."),
+        "constructor calls an action:\n{new}"
+    );
+}
+
+#[test]
+fn test_start_is_emitted_even_with_no_entry_actions() {
+    // Uniform calling pattern: the caller should not have to know whether this
+    // particular machine happens to need it.
+    let code = generate(
+        r#"
+        fsm Probe {
+            [*] --> Idle
+            state Idle
+            state Busy
+            Idle --> Busy : Go
+        }
+    "#,
+    );
+
+    assert!(code.contains("pub fn start(&mut self) {"));
+    assert!(code.contains("// The initial state has no entry actions."));
+}
+
+#[test]
+fn test_usage_doc_shows_start() {
+    let code = generate(CONNECTION_MANAGER);
+    assert!(code.contains("/// machine.start();"));
+}

@@ -414,6 +414,7 @@ fn generate_usage_doc(fsm: &FsmDefinition) -> String {
     doc.push_str(&format!(
         "/// let mut machine = {name}::new(Hardware::new());\n"
     ));
+    doc.push_str("/// machine.start();   // runs the initial state's entry actions\n");
     doc.push_str(&format!(
         "/// assert_eq!(machine.state(), {name}State::{});\n",
         to_pascal_case(initial)
@@ -514,6 +515,32 @@ fn generate_test_module(fsm: &FsmDefinition) -> String {
             "        let machine = {name}::new(Recorder::new());\n        assert_eq!(machine.state(), {name}State::{});\n",
             to_pascal_case(initial)
         ));
+        code.push_str("    }\n\n");
+
+        let initial_entry: Vec<String> = fsm
+            .states
+            .iter()
+            .find(|s| s.name == *initial)
+            .map(|s| s.entry_actions.iter().map(|a| to_snake_case(&a.name)).collect())
+            .unwrap_or_default();
+
+        code.push_str("    #[test]\n    fn start_runs_the_initial_entry_actions() {\n");
+        code.push_str(&format!(
+            "        let mut machine = {name}::new(Recorder::new());\n        machine.start();\n\n"
+        ));
+        if initial_entry.is_empty() {
+            code.push_str("        // The initial state has no entry actions.\n");
+            code.push_str("        assert!(machine.context().calls.is_empty());\n");
+        } else {
+            code.push_str(&format!(
+                "        assert_eq!(machine.context().calls, [{}]);\n",
+                initial_entry
+                    .iter()
+                    .map(|a| format!("\"{a}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
         code.push_str("    }\n\n");
     }
 
@@ -858,7 +885,39 @@ fn generate_fsm_impl(fsm: &FsmDefinition) -> String {
     code.push_str("            context,\n");
     code.push_str("        }\n");
     code.push_str("    }\n\n");
-    
+
+    // Entering the initial state should run its entry actions, but nothing
+    // transitions into it — `new` only assigns the field — so they never ran.
+    //
+    // Kept out of `new` on purpose: on an embedded target the machine is often
+    // constructed before the peripherals its actions drive are ready, and a
+    // constructor with side effects gives no way to delay them.
+    let initial_entry: Vec<&crate::fsm::Action> = fsm
+        .states
+        .iter()
+        .find(|s| Some(&s.name) == fsm.initial_state.as_ref())
+        .map(|s| s.entry_actions.iter().collect())
+        .unwrap_or_default();
+
+    code.push_str("    /// Runs the entry actions of the initial state.\n");
+    code.push_str("    ///\n");
+    code.push_str("    /// Call once, when the machine should begin. Separate from `new` so that\n");
+    code.push_str("    /// construction has no side effects.\n");
+    code.push_str("    pub fn start(&mut self) {\n");
+    if initial_entry.is_empty() {
+        code.push_str("        // The initial state has no entry actions.\n");
+    } else {
+        let signatures = action_signatures(fsm);
+        for action in initial_entry {
+            // `action_call_line` indents for a match arm; this sits one level in.
+            code.push_str(&format!(
+                "        {}",
+                action_call_line(action, &signatures).trim_start()
+            ));
+        }
+    }
+    code.push_str("    }\n\n");
+
     // State getter
     code.push_str(&format!("    pub fn state(&self) -> {}State {{\n", fsm.name));
     code.push_str("        self.state\n");
