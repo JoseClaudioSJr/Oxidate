@@ -595,6 +595,18 @@ fn generate_test_module(fsm: &FsmDefinition) -> String {
             .filter_map(|t| t.guard.as_ref().map(|g| to_guard_ident(&g.expression)))
             .collect();
 
+        // Where a choice point decides the destination, it depends on guards
+        // evaluated at run time. Every branch is reachable, so no single target
+        // can be asserted; the branches deserve their own tests, driven by the
+        // recorder's guard flags.
+        if let Some(choice) = choice_target(&transition.target, fsm) {
+            code.push_str(&format!(
+                "    // Skipped: '{}' leads to choice point '{}', whose destination depends\n                 \x20   // on guards. Set the flags on `Recorder` to exercise each branch.\n\n",
+                transition.source, choice.name
+            ));
+            continue;
+        }
+
         let target = if transition.target == "[*]" {
             final_variant_name(fsm)
         } else {
@@ -775,6 +787,15 @@ fn collect_guard_idents(fsm: &FsmDefinition) -> Vec<String> {
         .iter()
         .chain(fsm.states.iter().flat_map(|s| s.internal_transitions.iter()))
         .filter_map(|t| t.guard.as_ref().map(|g| to_guard_ident(&g.expression)))
+        // Choice branches are guards too, and the recorder has to implement
+        // them or it no longer satisfies the actions trait.
+        .chain(
+            fsm.choice_points
+                .iter()
+                .flat_map(|c| c.branches.iter())
+                .filter(|b| !is_else_branch(b))
+                .map(|b| to_guard_ident(&b.guard.expression)),
+        )
         .collect();
     guards.sort();
     guards.dedup();
@@ -793,6 +814,12 @@ fn collect_action_idents(fsm: &FsmDefinition) -> Vec<String> {
                 .iter()
                 .chain(fsm.states.iter().flat_map(|s| s.internal_transitions.iter()))
                 .filter_map(|t| t.action.as_ref().map(|a| to_snake_case(&a.name))),
+        )
+        .chain(
+            fsm.choice_points
+                .iter()
+                .flat_map(|c| c.branches.iter())
+                .filter_map(|b| b.action.as_ref().map(|a| to_snake_case(&a.name))),
         )
         .collect();
     actions.sort();
@@ -1048,16 +1075,28 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
                 code.push_str(&action_call_line(action, &signatures));
             }
             
-            // State change
-            code.push_str(&format!(
-                "                self.state = {}State::{};\n",
-                fsm.name, target
-            ));
-            
-            // Entry actions
-            if let Some(state) = fsm.states.iter().find(|s| s.name == transition.target) {
-                for entry_action in &state.entry_actions {
-                    code.push_str(&action_call_line(entry_action, &signatures));
+            // A choice point is reached *after* the transition's actions have
+            // run, and picks the destination itself.
+            if let Some(choice) = choice_target(&transition.target, fsm) {
+                code.push_str(&generate_choice_chain(
+                    fsm,
+                    choice,
+                    "                ",
+                    0,
+                    &signatures,
+                ));
+            } else {
+                // State change
+                code.push_str(&format!(
+                    "                self.state = {}State::{};\n",
+                    fsm.name, target
+                ));
+
+                // Entry actions
+                if let Some(state) = fsm.states.iter().find(|s| s.name == transition.target) {
+                    for entry_action in &state.entry_actions {
+                        code.push_str(&action_call_line(entry_action, &signatures));
+                    }
                 }
             }
             
@@ -1128,6 +1167,22 @@ fn generate_action_trait(fsm: &FsmDefinition) -> String {
     
     code.push_str(&format!("pub trait {}Actions {{\n", fsm.name));
     
+    // Choice branches carry their own guards and actions.
+    for choice in &fsm.choice_points {
+        for branch in &choice.branches {
+            if !is_else_branch(branch) {
+                guards.push(branch.guard.expression.clone());
+            }
+            if let Some(action) = &branch.action {
+                actions.push(action.name.clone());
+            }
+        }
+    }
+    actions.sort();
+    actions.dedup();
+    guards.sort();
+    guards.dedup();
+
     let signatures = action_signatures(fsm);
     for action in &actions {
         let name = to_snake_case(action);
@@ -1267,6 +1322,128 @@ fn action_call_line(
     format!("                self.context.{name}({});\n", args.join(", "))
 }
 
+/// The choice point a transition target names, if it is one.
+///
+/// Targets are written `<<Name>>` in the DSL.
+fn choice_target<'a>(target: &str, fsm: &'a FsmDefinition) -> Option<&'a crate::fsm::ChoicePoint> {
+    let name = target.strip_prefix("<<")?.strip_suffix(">>")?;
+    fsm.choice_points.iter().find(|c| c.name == name)
+}
+
+/// Whether a branch is the `[else]` fallback rather than a guarded one.
+fn is_else_branch(branch: &crate::fsm::ChoiceBranch) -> bool {
+    branch.guard.expression.trim().eq_ignore_ascii_case("else")
+}
+
+/// Emits the guard chain a choice point expands into.
+///
+/// UML evaluates a choice dynamically: control reaches it *after* the incoming
+/// transition's actions have run, and the first branch whose guard holds is
+/// taken. That maps onto `if / else if / else`.
+///
+/// `indent` is the leading whitespace for the block, and `depth` guards against
+/// a choice that reaches itself.
+fn generate_choice_chain(
+    fsm: &FsmDefinition,
+    choice: &crate::fsm::ChoicePoint,
+    indent: &str,
+    depth: usize,
+    signatures: &std::collections::HashMap<String, Vec<ParamType>>,
+) -> String {
+    let mut code = String::new();
+
+    if depth > 8 {
+        code.push_str(&format!(
+            "{indent}// Choice '{}' nests too deeply; giving up to avoid looping.\n",
+            choice.name
+        ));
+        return code;
+    }
+
+    let guarded: Vec<&crate::fsm::ChoiceBranch> =
+        choice.branches.iter().filter(|b| !is_else_branch(b)).collect();
+    let fallback = choice.branches.iter().find(|b| is_else_branch(b));
+
+    for (position, branch) in guarded.iter().enumerate() {
+        let keyword = if position == 0 { "if" } else { "} else if" };
+        code.push_str(&format!(
+            "{indent}{keyword} self.context.{}() {{\n",
+            to_guard_ident(&branch.guard.expression)
+        ));
+        code.push_str(&branch_body(fsm, branch, indent, depth, signatures));
+    }
+
+    match (guarded.is_empty(), fallback) {
+        // Only an [else]: no decision to make.
+        (true, Some(branch)) => {
+            code.push_str(&branch_body(fsm, branch, &indent[4..], depth, signatures));
+        }
+        (false, Some(branch)) => {
+            code.push_str(&format!("{indent}}} else {{\n"));
+            code.push_str(&branch_body(fsm, branch, indent, depth, signatures));
+            code.push_str(&format!("{indent}}}\n"));
+        }
+        // No [else]: with every guard false the machine stays where it is, which
+        // is the only choice that cannot invent a transition the author did not
+        // write. Said out loud, because a missing [else] is easy to overlook.
+        (false, None) => {
+            code.push_str(&format!("{indent}}}\n"));
+            code.push_str(&format!(
+                "{indent}// No [else] branch: if no guard holds, the state is left unchanged.\n"
+            ));
+        }
+        (true, None) => {}
+    }
+
+    code
+}
+
+/// The body of one choice branch: its action, then the state change.
+fn branch_body(
+    fsm: &FsmDefinition,
+    branch: &crate::fsm::ChoiceBranch,
+    indent: &str,
+    depth: usize,
+    signatures: &std::collections::HashMap<String, Vec<ParamType>>,
+) -> String {
+    let mut code = String::new();
+    let inner = format!("{indent}    ");
+
+    if let Some(action) = &branch.action {
+        code.push_str(&format!(
+            "{inner}{}",
+            action_call_line(action, signatures).trim_start()
+        ));
+    }
+
+    // A branch may itself target another choice point.
+    if let Some(nested) = choice_target(&branch.target, fsm) {
+        code.push_str(&generate_choice_chain(fsm, nested, &inner, depth + 1, signatures));
+        return code;
+    }
+
+    let target = if branch.target == "[*]" {
+        final_variant_name(fsm)
+    } else {
+        to_pascal_case(&branch.target)
+    };
+    code.push_str(&format!(
+        "{inner}self.state = {}State::{target};\n",
+        fsm.name
+    ));
+
+    if let Some(state) = fsm.states.iter().find(|s| s.name == branch.target) {
+        for entry in &state.entry_actions {
+            code.push_str(&format!(
+                "{inner}{}",
+                action_call_line(entry, signatures).trim_start()
+            ));
+        }
+    }
+
+    code
+}
+
 /// How an action parameter is typed in the generated trait method.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ParamType {
@@ -1329,6 +1506,12 @@ fn all_actions(fsm: &FsmDefinition) -> Vec<&crate::fsm::Action> {
                 .enumerate()
                 .filter(|(index, _)| !shadowed.contains(index))
                 .filter_map(|(_, t)| t.action.as_ref()),
+        )
+        .chain(
+            fsm.choice_points
+                .iter()
+                .flat_map(|c| c.branches.iter())
+                .filter_map(|b| b.action.as_ref()),
         )
         .collect()
 }

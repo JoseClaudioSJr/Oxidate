@@ -21,10 +21,7 @@ use oxidate_fsm::{generate_rust_code, parse_fsm};
 ///
 /// An entry here is a known gap, not a passing case. When the feature lands,
 /// remove the entry and the example starts being compiled like the others.
-const KNOWN_REJECTED: &[(&str, &str)] = &[(
-    "form_submission",
-    "choice points are not implemented in the generator",
-)];
+const KNOWN_REJECTED: &[(&str, &str)] = &[];
 
 fn examples_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("examples")

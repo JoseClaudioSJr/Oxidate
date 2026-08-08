@@ -1192,3 +1192,125 @@ fn test_usage_doc_shows_start() {
     let code = generate(CONNECTION_MANAGER);
     assert!(code.contains("/// machine.start();"));
 }
+
+/// Two choice points, one with `[else]` and one without.
+const CHOICES: &str = r#"
+    fsm Form {
+        [*] --> Editing
+        state Editing { entry / clear() }
+        state Validating
+        state Submitting { entry / send() }
+        state Failed
+        Editing --> Validating : Submit
+        Validating --> <<Verdict>> : Checked
+        Submitting --> <<Outcome>> : Replied
+
+        choice Verdict {
+            [all_fields_valid] -> Submitting
+            [else] -> Editing / highlight_errors()
+        }
+
+        choice Outcome {
+            [ok] -> Editing
+            [retryable] -> Submitting / increment_retry()
+        }
+    }
+"#;
+
+#[test]
+fn test_choice_point_expands_into_a_guard_chain() {
+    // UML evaluates a choice after the incoming transition's actions have run,
+    // taking the first branch whose guard holds.
+    let code = generate(CHOICES);
+
+    let arm = code
+        .split("(FormState::Validating, FormEvent::Checked) => {")
+        .nth(1)
+        .expect("no arm for the transition into the choice point");
+    let arm = arm.split("\n            (").next().unwrap();
+
+    assert!(arm.contains("if self.context.all_fields_valid() {"));
+    assert!(arm.contains("self.state = FormState::Submitting;"));
+    assert!(arm.contains("} else {"));
+    // The [else] branch's own action runs before the state change.
+    let highlight = arm.find("highlight_errors").expect("else action missing");
+    let editing = arm.find("self.state = FormState::Editing;").expect("else target");
+    assert!(highlight < editing, "branch action must precede the state change");
+}
+
+#[test]
+fn test_choice_branch_runs_the_target_entry_actions() {
+    let code = generate(CHOICES);
+
+    let arm = code
+        .split("(FormState::Validating, FormEvent::Checked) => {")
+        .nth(1)
+        .unwrap();
+    let arm = arm.split("\n            (").next().unwrap();
+
+    let set_state = arm.find("self.state = FormState::Submitting;").unwrap();
+    let entry = arm.find("self.context.send();").expect("entry action missing");
+    assert!(set_state < entry, "entry action must follow the state change");
+}
+
+#[test]
+fn test_choice_without_else_leaves_the_state_alone() {
+    // Inventing a destination the author did not write would be worse than
+    // staying put, but it is easy to overlook, so the output says so.
+    let code = generate(CHOICES);
+
+    let arm = code
+        .split("(FormState::Submitting, FormEvent::Replied) => {")
+        .nth(1)
+        .unwrap();
+    let arm = arm.split("\n            (").next().unwrap();
+
+    assert!(arm.contains("if self.context.ok() {"));
+    assert!(arm.contains("} else if self.context.retryable() {"));
+    assert!(
+        arm.contains("No [else] branch"),
+        "missing note about the absent fallback:\n{arm}"
+    );
+}
+
+#[test]
+fn test_choice_guards_and_actions_reach_the_trait() {
+    let code = generate(CHOICES);
+
+    assert!(code.contains("fn all_fields_valid(&self) -> bool;"));
+    assert!(code.contains("fn retryable(&self) -> bool;"));
+    assert!(code.contains("fn highlight_errors(&mut self);"));
+    assert!(code.contains("fn increment_retry(&mut self);"));
+    // `[else]` is not a guard.
+    assert!(!code.contains("fn else"));
+}
+
+#[test]
+fn test_undefined_choice_point_is_rejected() {
+    let errors = expect_errors(
+        r#"
+        fsm Probe {
+            [*] --> A
+            state A
+            A --> <<Missing>> : Go
+        }
+    "#,
+    );
+
+    assert!(
+        errors.iter().any(|e| e.contains("Missing")),
+        "expected an undefined choice point error, got {errors:?}"
+    );
+}
+
+#[test]
+fn test_transition_into_a_choice_gets_a_note_instead_of_a_test() {
+    // The destination depends on run-time guards, so no single target can be
+    // asserted.
+    let code = generate(CHOICES);
+
+    assert!(
+        code.contains("leads to choice point 'Verdict'"),
+        "expected a note explaining the skipped test:\n{code}"
+    );
+}
