@@ -285,6 +285,21 @@ fn parse_choice_branch(pair: pest::iterators::Pair<Rule>) -> ParseResult<ChoiceB
     })
 }
 
+/// Normalises a state description.
+///
+/// The grammar captures everything up to `{` or a newline, so a quoted
+/// description arrives with its quotes attached and they ended up inside the
+/// generated doc comment: `/// "Stop - vehicles must wait"`.
+fn clean_description(raw: &str) -> String {
+    let trimmed = raw.trim();
+    trimmed
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(trimmed)
+        .trim()
+        .to_string()
+}
+
 fn parse_state_definition(pair: pest::iterators::Pair<Rule>) -> ParseResult<State> {
     let mut inner = pair.into_inner();
     let name = inner.next().unwrap().as_str().to_string();
@@ -294,7 +309,7 @@ fn parse_state_definition(pair: pest::iterators::Pair<Rule>) -> ParseResult<Stat
     for item in inner {
         match item.as_rule() {
             Rule::description => {
-                state.description = Some(item.as_str().trim().to_string());
+                state.description = Some(clean_description(item.as_str()));
             }
             Rule::state_body_item => {
                 parse_state_body_item(item, &mut state)?;

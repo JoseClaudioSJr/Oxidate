@@ -352,10 +352,7 @@ fn test_implicit_then_explicit_declaration_still_merges() {
 
     let fsms = parse_fsm(source).expect("should parse");
     let b = fsms[0].states.iter().find(|s| s.name == "B").expect("B");
-    // Descriptions currently keep their surrounding quotes, which is why the
-    // generated doc comment reads `/// "arrived"`. Asserted as-is so this test
-    // is about the merge, not about that.
-    assert_eq!(b.description.as_deref(), Some("\"arrived\""));
+    assert_eq!(b.description.as_deref(), Some("arrived"));
     assert_eq!(b.entry_actions.len(), 1);
 }
 
@@ -370,4 +367,27 @@ fn test_two_fsms_with_the_same_name_are_rejected() {
 
     let error = parse_fsm(source).expect_err("duplicate fsm name should be rejected");
     assert!(error.to_string().contains("more than once"), "{error}");
+}
+
+#[test]
+fn test_description_quotes_are_stripped() {
+    // The grammar captures up to `{` or a newline, so the quotes came along and
+    // ended up inside the generated doc comment: `/// "Stop - wait for green"`.
+    let fsms = parse_fsm(
+        r#"
+        fsm Probe {
+            [*] --> Red
+            state Red: "Stop - wait for green"
+            state Green: Go now
+        }
+    "#,
+    )
+    .expect("should parse");
+
+    let red = fsms[0].states.iter().find(|s| s.name == "Red").unwrap();
+    assert_eq!(red.description.as_deref(), Some("Stop - wait for green"));
+
+    // An unquoted description is left as it was written.
+    let green = fsms[0].states.iter().find(|s| s.name == "Green").unwrap();
+    assert_eq!(green.description.as_deref(), Some("Go now"));
 }

@@ -758,20 +758,10 @@ fn generate_state_enum(fsm: &FsmDefinition) -> String {
 fn generate_event_enum(fsm: &FsmDefinition) -> String {
     let mut code = String::new();
     
-    // Collect unique events from external transitions...
-    let mut events: Vec<String> = fsm.transitions
-        .iter()
-        .filter_map(|t| t.event.as_ref().map(|e| e.name.clone()))
-        .collect();
-    // ...and from internal transitions declared inside state bodies.
-    events.extend(
-        fsm.states
-            .iter()
-            .flat_map(|s| s.internal_transitions.iter())
-            .filter_map(|t| t.event.as_ref().map(|e| e.name.clone())),
-    );
-    events.sort();
-    events.dedup();
+    // `collect_events` already gathers external and internal transition events,
+    // sorted and deduplicated. It existed and had no caller, while this function
+    // kept its own copy of the same logic.
+    let events: Vec<String> = fsm.collect_events().into_iter().map(|e| e.name).collect();
 
     // Even with no events the enum has to exist: `process()` takes it as a
     // parameter, so returning early left a reference to an undefined type.
