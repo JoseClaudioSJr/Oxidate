@@ -544,3 +544,171 @@ fn test_valid_fsm_is_not_rejected() {
         "a valid FSM was rejected by validation"
     );
 }
+
+#[test]
+fn test_generated_code_includes_a_test_module() {
+    let code = generate(CONNECTION_MANAGER);
+
+    assert!(
+        code.contains("#[cfg(test)]\nmod generated_tests {"),
+        "no test module emitted:\n{code}"
+    );
+    // Gated on cfg(test), so it costs nothing in a release build.
+    assert!(code.contains("fn starts_in_initial_state()"));
+}
+
+#[test]
+fn test_generated_tests_assert_action_order() {
+    let code = generate(CONNECTION_MANAGER);
+
+    // Connecting has exit stop_timer; the transition has on_connected; Connected
+    // has entry start_timer. The assertion must list them in UML order.
+    assert!(
+        code.contains(r#"assert_eq!(machine.context().calls, ["stop_timer", "on_connected", "start_timer"]);"#),
+        "expected an ordered action assertion:\n{code}"
+    );
+}
+
+#[test]
+fn test_generated_recorder_exposes_one_flag_per_guard() {
+    let code = generate(
+        r#"
+        fsm Guards {
+            [*] --> Idle
+            state Idle
+            state A
+            state B
+            Idle --> A : Check [ready]
+            Idle --> B : Check [attempts > 3]
+        }
+    "#,
+    );
+
+    assert!(code.contains("        ready: bool,"));
+    assert!(code.contains("        attempts_gt_3: bool,"));
+    // Guards default to true so a guarded transition is exercised.
+    assert!(code.contains("                ready: true,"));
+}
+
+#[test]
+fn test_generated_test_disables_shadowing_guard() {
+    // Two guarded arms on the same (state, event): the second is only reachable
+    // once the first guard is false, and the generated test must arrange that.
+    let code = generate(
+        r#"
+        fsm Shadow {
+            [*] --> Idle
+            state Idle
+            state A
+            state B
+            Idle --> A : Check [first]
+            Idle --> B : Check [second]
+        }
+    "#,
+    );
+
+    let test = code
+        .split("fn idle_on_check_reaches_b()")
+        .nth(1)
+        .expect("no test generated for the shadowed transition");
+    let test = test.split("    }").next().unwrap();
+
+    assert!(
+        test.contains("machine.context_mut().first = false;"),
+        "shadowing guard not disabled:\n{test}"
+    );
+}
+
+#[test]
+fn test_unreachable_state_is_skipped_with_a_reason() {
+    // Nothing leads to Orphan, so no test can drive the machine into it.
+    let code = generate(
+        r#"
+        fsm Unreachable {
+            [*] --> Idle
+            state Idle
+            state Orphan
+            state Done
+            Idle --> Done : Go
+            Orphan --> Done : Go
+        }
+    "#,
+    );
+
+    assert!(
+        code.contains("// Skipped: 'Orphan' is not reachable"),
+        "expected a skip note explaining why:\n{code}"
+    );
+}
+
+#[test]
+fn test_internal_transition_gets_its_own_test() {
+    let code = generate(CONNECTION_MANAGER);
+
+    let test = code
+        .split("fn connected_on_keepalive_tick_stays_put()")
+        .nth(1)
+        .expect("no test generated for the internal transition");
+    let test = test.split("\n    }").next().unwrap();
+
+    assert!(test.contains(r#"assert_eq!(machine.context().calls, ["send_keepalive"]);"#));
+    // No exit or entry actions should run.
+    assert!(!test.contains("stop_timer"));
+    assert!(!test.contains("start_timer"));
+}
+
+#[test]
+fn test_transition_shadowed_by_internal_gets_no_test() {
+    // `generate_process_event` drops the external arm here, so a test for it
+    // would assert behaviour the machine does not have.
+    let code = generate(
+        r#"
+        fsm Shadowed {
+            [*] --> Busy
+            state Busy {
+                Poke / handle_internally()
+            }
+            Busy --> Busy : Poke / handle_externally()
+        }
+    "#,
+    );
+
+    assert!(
+        code.contains("// Skipped: an internal transition on 'Poke' takes precedence"),
+        "expected a skip note for the shadowed transition:\n{code}"
+    );
+    assert!(
+        !code.contains("handle_externally\"]"),
+        "a test still asserts the shadowed action:\n{code}"
+    );
+    // The internal transition is covered instead.
+    assert!(code.contains("fn busy_on_poke_stays_put()"));
+}
+
+#[test]
+fn test_generated_file_documents_how_to_use_it() {
+    let code = generate(CONNECTION_MANAGER);
+
+    assert!(code.contains("//! # Usage"));
+    // Real names, not generic boilerplate.
+    assert!(code.contains("//! impl ConnectionManagerActions for Hardware {"));
+    assert!(code.contains("//! let mut machine = ConnectionManager::new(Hardware::new());"));
+    assert!(code.contains("//! assert_eq!(machine.state(), ConnectionManagerState::Disconnected);"));
+    // `ignore` because Hardware is illustrative; a doctest would fail to compile.
+    assert!(code.contains("//! ```ignore"));
+}
+
+#[test]
+fn test_usage_doc_shows_a_real_transition() {
+    let code = generate(CONNECTION_MANAGER);
+
+    assert!(code.contains("//! machine.process(ConnectionManagerEvent::Connect);"));
+    assert!(code.contains("//! assert_eq!(machine.state(), ConnectionManagerState::Connecting);"));
+}
+
+#[test]
+fn test_usage_doc_warns_about_dropped_events() {
+    // Worth stating: `process` returns (), so a dropped event is invisible.
+    let code = generate(CONNECTION_MANAGER);
+    assert!(code.contains("silently ignores an event with no transition"));
+}
