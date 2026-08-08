@@ -313,3 +313,61 @@ fn test_implicit_state_creation() {
     assert!(fsm.states.iter().any(|s| s.name == "B"));
     assert!(fsm.states.iter().any(|s| s.name == "C"));
 }
+
+#[test]
+fn test_state_declared_twice_is_rejected() {
+    // The merge used to overwrite the description and discard the earlier
+    // internal transitions, so a duplicate silently lost part of the model.
+    let source = r#"
+        fsm Probe {
+            [*] --> A
+            state A: "important" {
+                Tick / on_tick()
+            }
+            state B
+            A --> B : Go
+            state A { entry / late() }
+        }
+    "#;
+
+    let error = parse_fsm(source).expect_err("duplicate declaration should be rejected");
+    let message = error.to_string();
+    assert!(
+        message.contains("'A'") && message.contains("more than once"),
+        "unexpected error: {message}"
+    );
+}
+
+#[test]
+fn test_implicit_then_explicit_declaration_still_merges() {
+    // A transition creates its endpoints implicitly and bare; filling one in
+    // afterwards is the legitimate use of the merge and must keep working.
+    let source = r#"
+        fsm Probe {
+            [*] --> A
+            A --> B : Go
+            state B: "arrived" { entry / on_arrive() }
+        }
+    "#;
+
+    let fsms = parse_fsm(source).expect("should parse");
+    let b = fsms[0].states.iter().find(|s| s.name == "B").expect("B");
+    // Descriptions currently keep their surrounding quotes, which is why the
+    // generated doc comment reads `/// "arrived"`. Asserted as-is so this test
+    // is about the merge, not about that.
+    assert_eq!(b.description.as_deref(), Some("\"arrived\""));
+    assert_eq!(b.entry_actions.len(), 1);
+}
+
+#[test]
+fn test_two_fsms_with_the_same_name_are_rejected() {
+    // Both would generate a `SameState` enum; written to one module that is a
+    // compile error found much later.
+    let source = r#"
+        fsm Same { [*] --> A state A }
+        fsm Same { [*] --> B state B }
+    "#;
+
+    let error = parse_fsm(source).expect_err("duplicate fsm name should be rejected");
+    assert!(error.to_string().contains("more than once"), "{error}");
+}

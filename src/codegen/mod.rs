@@ -289,6 +289,14 @@ fn generate_standard_code(fsm: &FsmDefinition) -> String {
     // Anything the generator deliberately left out is stated here rather than
     // dropped in silence: the author wrote it and would otherwise be left
     // wondering why it never runs.
+    let warnings = model_warnings(fsm);
+    if !warnings.is_empty() {
+        code.push_str("\n");
+        for warning in &warnings {
+            code.push_str(&format!("// Warning: {warning}.\n"));
+        }
+    }
+
     let shadowed = shadowed_transition_indices(fsm);
     if !shadowed.is_empty() {
         code.push_str("\n");
@@ -1145,6 +1153,73 @@ fn final_variant_name(fsm: &FsmDefinition) -> String {
         name.push('_');
     }
     name
+}
+
+/// Modelling problems worth telling the author about, but not worth refusing to
+/// generate over.
+///
+/// There is no warning channel — `validate` returns errors only — so these are
+/// emitted as comments in the output, where the author is already looking. The
+/// same route the superseded-transition note takes.
+fn model_warnings(fsm: &FsmDefinition) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    let reachable = reachable_states(fsm);
+
+    for state in &fsm.states {
+        if !reachable.contains(&state.name) {
+            warnings.push(format!(
+                "state '{}' is unreachable: no transition leads to it, so the machine \
+                 can never be in it",
+                state.name
+            ));
+        }
+    }
+
+    for state in &fsm.states {
+        let leaves = fsm
+            .transitions
+            .iter()
+            .any(|t| t.source == state.name && t.target != state.name);
+        let terminal = fsm
+            .transitions
+            .iter()
+            .any(|t| t.source == state.name && t.target == "[*]");
+        if !leaves && !terminal && reachable.contains(&state.name) {
+            warnings.push(format!(
+                "state '{}' has no way out: once entered the machine stays there. \
+                 Add a transition, or route it to [*] to mark it as final",
+                state.name
+            ));
+        }
+    }
+
+    warnings
+}
+
+/// States reachable from the initial state, following transitions.
+fn reachable_states(fsm: &FsmDefinition) -> std::collections::HashSet<String> {
+    let mut seen = std::collections::HashSet::new();
+    let Some(initial) = fsm.initial_state.clone() else {
+        return seen;
+    };
+    seen.insert(initial.clone());
+
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(initial);
+
+    while let Some(current) = queue.pop_front() {
+        for transition in &fsm.transitions {
+            if transition.source != current || transition.target == "[*]" {
+                continue;
+            }
+            if seen.insert(transition.target.clone()) {
+                queue.push_back(transition.target.clone());
+            }
+        }
+    }
+
+    seen
 }
 
 /// Indices of external transitions that an internal transition takes precedence

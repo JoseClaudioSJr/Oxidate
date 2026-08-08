@@ -51,6 +51,21 @@ pub fn parse_fsm(source: &str) -> ParseResult<Vec<FsmDefinition>> {
         }
     }
 
+    // Two machines sharing a name generate two `<Name>State` enums. Written to
+    // one module that is a compile error the author only meets much later.
+    for (index, fsm) in fsms.iter().enumerate() {
+        if let Some(earlier) = fsms[..index].iter().find(|f| f.name == fsm.name) {
+            return Err(ParseError::SyntaxError {
+                line: 0,
+                message: format!(
+                    "fsm '{}' is defined more than once in this source; both would \
+                     generate a '{}State' enum",
+                    earlier.name, earlier.name
+                ),
+            });
+        }
+    }
+
     Ok(fsms)
 }
 
@@ -108,13 +123,36 @@ fn parse_fsm_item(pair: pest::iterators::Pair<Rule>, fsm: &mut FsmDefinition) ->
             fsm.choice_points.push(choice);
         }
         Rule::state_simple | Rule::state_with_body => {
+            let line = inner.line_col().0;
             let state = parse_state_definition(inner)?;
-            // Update existing or add new
+
+            // A transition mentioning a state creates it implicitly, bare. Filling
+            // that in is the legitimate use of this merge.
+            //
+            // A second explicit declaration is not: the previous body used to be
+            // partly overwritten — the description replaced (with `None` if the
+            // second had none) and internal transitions discarded outright — so a
+            // duplicate silently lost part of the model.
             if let Some(existing) = fsm.states.iter_mut().find(|s| s.name == state.name) {
+                let already_has_a_body = existing.description.is_some()
+                    || !existing.entry_actions.is_empty()
+                    || !existing.exit_actions.is_empty()
+                    || !existing.internal_transitions.is_empty();
+
+                if already_has_a_body {
+                    return Err(ParseError::SyntaxError {
+                        line,
+                        message: format!(
+                            "state '{}' is declared more than once; merge the declarations",
+                            state.name
+                        ),
+                    });
+                }
+
                 existing.description = state.description;
                 existing.entry_actions.extend(state.entry_actions);
                 existing.exit_actions.extend(state.exit_actions);
-                existing.internal_transitions = state.internal_transitions;
+                existing.internal_transitions.extend(state.internal_transitions);
             } else {
                 fsm.states.push(state);
             }
