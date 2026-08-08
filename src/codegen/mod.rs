@@ -166,6 +166,25 @@ fn validate_for_codegen(fsm: &FsmDefinition) -> Result<(), CodegenErrors> {
     // Uniqueness is not enough: the identifier also has to be legal Rust.
     check_identifiers_are_legal(fsm, &mut errors);
 
+    // One trait method cannot take a different number of arguments per call.
+    let mut arities: std::collections::HashMap<String, (usize, String)> =
+        std::collections::HashMap::new();
+    for action in all_actions(fsm) {
+        let name = to_snake_case(&action.name);
+        let arity = action.params.len();
+        match arities.get(&name) {
+            Some((seen, example)) if *seen != arity => errors.push(format!(
+                "action '{}' is called with {} argument(s) here and {} in '{}'; \
+                 a trait method must take the same arguments everywhere",
+                action.name, arity, seen, example
+            )),
+            None => {
+                arities.insert(name, (arity, action.name.clone()));
+            }
+            _ => {}
+        }
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -362,8 +381,19 @@ fn generate_usage_doc(fsm: &FsmDefinition) -> String {
 
     // A couple of real signatures is enough to show the shape; listing every
     // method would bury the interesting part on a large machine.
+    let signatures = action_signatures(fsm);
     for action in actions.iter().take(3) {
-        doc.push_str(&format!("///     fn {action}(&mut self) {{ /* ... */ }}\n"));
+        let params = signatures
+            .get(action)
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, kind)| format!(", arg{}: {}", i + 1, kind.rust_type()))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        doc.push_str(&format!("///     fn {action}(&mut self{params}) {{ /* ... */ }}\n"));
     }
     if actions.len() > 3 {
         doc.push_str(&format!(
@@ -454,9 +484,20 @@ fn generate_test_module(fsm: &FsmDefinition) -> String {
     code.push_str("            }\n        }\n    }\n\n");
 
     code.push_str(&format!("    impl {name}Actions for Recorder {{\n"));
+    let signatures = action_signatures(fsm);
     for action in &actions {
+        let params = signatures
+            .get(action)
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, kind)| format!(", _arg{}: {}", i + 1, kind.rust_type()))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
         code.push_str(&format!(
-            "        fn {action}(&mut self) {{\n            self.calls.push(\"{action}\");\n        }}\n"
+            "        fn {action}(&mut self{params}) {{\n            self.calls.push(\"{action}\");\n        }}\n"
         ));
     }
     for guard in &guards {
@@ -842,6 +883,7 @@ fn generate_fsm_impl(fsm: &FsmDefinition) -> String {
 
 fn generate_process_event(fsm: &FsmDefinition) -> String {
     let mut code = String::new();
+    let signatures = action_signatures(fsm);
     
     code.push_str(&format!("    pub fn process(&mut self, event: {}Event) {{\n", fsm.name));
     code.push_str("        match (self.state, event) {\n");
@@ -871,10 +913,7 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
             }
 
             if let Some(ref action) = internal.action {
-                code.push_str(&format!(
-                    "                self.context.{}();\n",
-                    to_snake_case(&action.name)
-                ));
+                code.push_str(&action_call_line(action, &signatures));
             }
 
             code.push_str("                // Internal transition: state unchanged\n");
@@ -941,19 +980,13 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
             // Exit actions
             if let Some(state) = fsm.states.iter().find(|s| s.name == transition.source) {
                 for exit_action in &state.exit_actions {
-                    code.push_str(&format!(
-                        "                self.context.{}();\n",
-                        to_snake_case(&exit_action.name)
-                    ));
+                    code.push_str(&action_call_line(exit_action, &signatures));
                 }
             }
             
             // Transition action
             if let Some(ref action) = transition.action {
-                code.push_str(&format!(
-                    "                self.context.{}();\n",
-                    to_snake_case(&action.name)
-                ));
+                code.push_str(&action_call_line(action, &signatures));
             }
             
             // State change
@@ -965,10 +998,7 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
             // Entry actions
             if let Some(state) = fsm.states.iter().find(|s| s.name == transition.target) {
                 for entry_action in &state.entry_actions {
-                    code.push_str(&format!(
-                        "                self.context.{}();\n",
-                        to_snake_case(&entry_action.name)
-                    ));
+                    code.push_str(&action_call_line(entry_action, &signatures));
                 }
             }
             
@@ -1039,8 +1069,20 @@ fn generate_action_trait(fsm: &FsmDefinition) -> String {
     
     code.push_str(&format!("pub trait {}Actions {{\n", fsm.name));
     
+    let signatures = action_signatures(fsm);
     for action in &actions {
-        code.push_str(&format!("    fn {}(&mut self);\n", to_snake_case(action)));
+        let name = to_snake_case(action);
+        let params = signatures
+            .get(&name)
+            .map(|kinds| {
+                kinds
+                    .iter()
+                    .enumerate()
+                    .map(|(i, kind)| format!(", arg{}: {}", i + 1, kind.rust_type()))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        code.push_str(&format!("    fn {name}(&mut self{params});\n"));
     }
     
     for guard in &guards {
@@ -1143,6 +1185,120 @@ fn final_variant_name(fsm: &FsmDefinition) -> String {
         name.push('_');
     }
     name
+}
+
+/// Renders `self.context.<action>(<args>);` for a call site.
+fn action_call_line(
+    action: &crate::fsm::Action,
+    signatures: &std::collections::HashMap<String, Vec<ParamType>>,
+) -> String {
+    let name = to_snake_case(&action.name);
+    let kinds = signatures.get(&name);
+    let args: Vec<String> = action
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, raw)| {
+            let kind = kinds
+                .and_then(|k| k.get(i).copied())
+                .unwrap_or_else(|| classify_param(raw));
+            param_expression(raw, kind)
+        })
+        .collect();
+    format!("                self.context.{name}({});\n", args.join(", "))
+}
+
+/// How an action parameter is typed in the generated trait method.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ParamType {
+    /// A whole number, passed through as written.
+    Integer,
+    /// A string literal, or a bare identifier naming something in the model.
+    Str,
+}
+
+impl ParamType {
+    fn rust_type(self) -> &'static str {
+        match self {
+            ParamType::Integer => "i64",
+            ParamType::Str => "&str",
+        }
+    }
+}
+
+/// Classifies one written parameter.
+fn classify_param(raw: &str) -> ParamType {
+    let trimmed = raw.trim();
+    if trimmed.starts_with('"') {
+        ParamType::Str
+    } else if trimmed.parse::<i64>().is_ok() {
+        ParamType::Integer
+    } else {
+        // A bare identifier names something in the model. There is no symbol
+        // type to hand the implementer, so it is passed as a string.
+        ParamType::Str
+    }
+}
+
+/// Renders a parameter as a Rust expression at the call site.
+fn param_expression(raw: &str, kind: ParamType) -> String {
+    let trimmed = raw.trim();
+    match kind {
+        ParamType::Integer => trimmed.to_string(),
+        ParamType::Str if trimmed.starts_with('"') => trimmed.to_string(),
+        // A bare identifier becomes a string literal, which is what makes
+        // `start_timer(keepalive)` and `start_timer(watchdog)` distinguishable.
+        ParamType::Str => format!("\"{trimmed}\""),
+    }
+}
+
+/// Every `Action` in the machine, wherever it appears.
+fn all_actions(fsm: &FsmDefinition) -> Vec<&crate::fsm::Action> {
+    let shadowed = shadowed_transition_indices(fsm);
+    fsm.states
+        .iter()
+        .flat_map(|state| {
+            state
+                .entry_actions
+                .iter()
+                .chain(state.exit_actions.iter())
+                .chain(state.internal_transitions.iter().filter_map(|t| t.action.as_ref()))
+        })
+        .chain(
+            fsm.transitions
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !shadowed.contains(index))
+                .filter_map(|(_, t)| t.action.as_ref()),
+        )
+        .collect()
+}
+
+/// The parameter list each action's trait method should take.
+///
+/// Types are inferred per position across every call site: all-integer stays
+/// `i64`, anything else becomes `&str`. Actions used with different arities are
+/// rejected in validation, so by the time this runs the arity is consistent.
+fn action_signatures(fsm: &FsmDefinition) -> std::collections::HashMap<String, Vec<ParamType>> {
+    let mut signatures: std::collections::HashMap<String, Vec<ParamType>> =
+        std::collections::HashMap::new();
+
+    for action in all_actions(fsm) {
+        let kinds: Vec<ParamType> = action.params.iter().map(|p| classify_param(p)).collect();
+        signatures
+            .entry(to_snake_case(&action.name))
+            .and_modify(|existing| {
+                for (slot, kind) in existing.iter_mut().zip(kinds.iter()) {
+                    // A single non-integer use makes the position a string.
+                    if *kind == ParamType::Str {
+                        *slot = ParamType::Str;
+                    }
+                }
+            })
+            .or_insert(kinds);
+    }
+
+    signatures
 }
 
 /// Modelling problems worth telling the author about, but not worth refusing to
