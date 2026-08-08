@@ -940,3 +940,69 @@ fn test_a_guarded_internal_transition_does_not_shadow() {
     assert!(code.contains("fn handle_externally(&mut self);"));
     assert!(!code.contains("// Note:"), "nothing should be reported as dropped");
 }
+
+#[test]
+fn test_unreachable_state_is_reported_in_the_output() {
+    // The machine can never be in it, so every arm the user writes for it is
+    // dead. Usually a modelling slip rather than intent.
+    let code = generate(
+        r#"
+        fsm Orphan {
+            [*] --> A
+            state A
+            state B
+            state Ghost
+            A --> B : Go
+            B --> A : Back
+        }
+    "#,
+    );
+
+    assert!(
+        code.contains("// Warning: state 'Ghost' is unreachable"),
+        "no warning for the unreachable state:\n{code}"
+    );
+}
+
+#[test]
+fn test_trap_state_is_reported_in_the_output() {
+    let code = generate(
+        r#"
+        fsm Trap {
+            [*] --> A
+            state A
+            state Stuck
+            A --> Stuck : Go
+        }
+    "#,
+    );
+
+    assert!(
+        code.contains("// Warning: state 'Stuck' has no way out"),
+        "no warning for the trap state:\n{code}"
+    );
+}
+
+#[test]
+fn test_a_state_routed_to_final_is_not_a_trap() {
+    // Terminating deliberately is not the same as forgetting a way out.
+    let code = generate(
+        r#"
+        fsm Fine {
+            [*] --> A
+            state A
+            state B
+            A --> B : Go
+            B --> [*] : Done
+        }
+    "#,
+    );
+
+    assert!(!code.contains("// Warning:"), "sound machine warned about:\n{code}");
+}
+
+#[test]
+fn test_a_sound_machine_produces_no_warnings() {
+    let code = generate(CONNECTION_MANAGER);
+    assert!(!code.contains("// Warning:"), "unexpected warnings:\n{code}");
+}
