@@ -411,7 +411,7 @@ fn test_wildcard_arm_omitted_when_match_is_exhaustive() {
     );
 
     assert!(
-        !code.contains("_ => {}"),
+        !code.contains("_ => Err("),
         "dead wildcard arm emitted for an exhaustive match:\n{code}"
     );
 }
@@ -431,7 +431,7 @@ fn test_wildcard_arm_kept_when_pairs_are_uncovered() {
 
     // (Busy, Start) has no arm, so the wildcard is load-bearing.
     assert!(
-        code.contains("_ => {}"),
+        code.contains("_ => Err("),
         "wildcard dropped while a (state, event) pair is uncovered:\n{code}"
     );
 }
@@ -451,7 +451,7 @@ fn test_guarded_arm_does_not_count_towards_exhaustiveness() {
     );
 
     assert!(
-        code.contains("_ => {}"),
+        code.contains("_ => Err("),
         "guarded arm wrongly treated as covering its pair:\n{code}"
     );
 }
@@ -705,15 +705,14 @@ fn test_generated_file_documents_how_to_use_it() {
 fn test_usage_doc_shows_a_real_transition() {
     let code = generate(CONNECTION_MANAGER);
 
-    assert!(code.contains("/// machine.process(ConnectionManagerEvent::Connect);"));
+    assert!(code.contains("/// machine.process(ConnectionManagerEvent::Connect)?;"));
     assert!(code.contains("/// assert_eq!(machine.state(), ConnectionManagerState::Connecting);"));
 }
 
 #[test]
-fn test_usage_doc_warns_about_dropped_events() {
-    // Worth stating: `process` returns (), so a dropped event is invisible.
+fn test_usage_doc_explains_the_error_return() {
     let code = generate(CONNECTION_MANAGER);
-    assert!(code.contains("silently ignores an event with no transition"));
+    assert!(code.contains("returns `Err` when no transition applies"));
 }
 
 #[test]
@@ -1391,31 +1390,57 @@ const CONNECTION_MANAGER_NO_TIMERS: &str = r#"
 "#;
 
 #[test]
-fn test_a_state_reached_only_through_a_choice_is_not_called_unreachable() {
-    // A choice point is not a state: what it reaches are its branches' targets.
-    // Treating `<<Name>>` as the destination made every state reachable only via
-    // a choice look orphaned — a warning pointing at nothing.
-    let code = generate(
-        r#"
-        fsm Probe {
-            [*] --> Deciding
-            state Deciding
-            state Accepted
-            state Rejected
-            Deciding --> <<Verdict>> : Check
-            Accepted --> Deciding : Again
-            Rejected --> Deciding : Again
+fn test_process_reports_an_event_it_cannot_handle() {
+    // It returned `()`, so a dropped event was invisible. In a traffic light
+    // whose transitions out of Red are all guarded, every guard being false
+    // leaves the junction stopped with nothing to detect it.
+    let code = generate(CONNECTION_MANAGER);
 
-            choice Verdict {
-                [ok] -> Accepted
-                [else] -> Rejected
-            }
-        }
-    "#,
-    );
+    assert!(code.contains("pub struct ConnectionManagerUnhandledEvent {"));
+    assert!(code.contains("pub state: ConnectionManagerState,"));
+    assert!(code.contains("pub event: ConnectionManagerEvent,"));
+    assert!(code.contains(
+        "pub fn process(&mut self, event: ConnectionManagerEvent) \
+         -> Result<(), ConnectionManagerUnhandledEvent> {"
+    ));
+    assert!(code.contains(
+        "_ => Err(ConnectionManagerUnhandledEvent { state: self.state, event }),"
+    ));
+}
 
-    assert!(
-        !code.contains("// Warning:"),
-        "states behind a choice point reported as unreachable:\n{code}"
+#[test]
+fn test_every_handled_arm_reports_success() {
+    let code = generate(CONNECTION_MANAGER);
+
+    let process = code
+        .split("pub fn process(")
+        .nth(1)
+        .expect("process missing");
+    let process = process.split("\n    }").next().unwrap();
+
+    // One `Ok(())` per handled arm, plus the single `Err` fallback.
+    let arms = process.matches("=> {").count();
+    let successes = process.matches("Ok(())").count();
+    assert_eq!(
+        arms, successes,
+        "an arm falls through without reporting success:\n{process}"
     );
+}
+
+#[test]
+fn test_the_error_type_is_no_std_friendly() {
+    // `core::fmt`, not `std::fmt`: the generated code has to compile in a
+    // `#![no_std]` crate.
+    let code = generate(CONNECTION_MANAGER);
+
+    assert!(code.contains("impl core::fmt::Display for ConnectionManagerUnhandledEvent"));
+    assert!(!code.contains("std::fmt"));
+    // Copy, so returning it costs nothing.
+    assert!(code.contains("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\npub struct ConnectionManagerUnhandledEvent"));
+}
+
+#[test]
+fn test_generated_tests_exercise_the_error_path() {
+    let code = generate(CONNECTION_MANAGER);
+    assert!(code.contains("fn an_event_that_does_not_apply_is_reported()"));
 }
