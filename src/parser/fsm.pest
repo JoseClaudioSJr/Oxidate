@@ -71,9 +71,17 @@ state_body_item = {
     | exit_action
     | timer_start
     | timer_stop
+    // A composite state contains a machine of its own: nested states, its own
+    // initial marker, and transitions between them. `fsm_item` already covers
+    // exactly that, so nesting is the same grammar one level down.
+    | nested_item
     | internal_transition
     | internal_action
 }
+
+// Ordered before the internal-transition forms, since `A --> B` would otherwise
+// be a candidate for `internal_action` once the arrow is consumed.
+nested_item = { initial_state | state_with_body | state_simple | transition }
 
 entry_action = { "entry" ~ "/" ~ action_call }
 exit_action = { "exit" ~ "/" ~ action_call }

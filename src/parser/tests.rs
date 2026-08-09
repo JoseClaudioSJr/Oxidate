@@ -1,5 +1,6 @@
 //! Unit tests for the FSM parser
 
+use crate::fsm::StateType;
 use crate::parser::parse_fsm;
 
 #[test]
@@ -390,4 +391,99 @@ fn test_description_quotes_are_stripped() {
     // An unquoted description is left as it was written.
     let green = fsms[0].states.iter().find(|s| s.name == "Green").unwrap();
     assert_eq!(green.description.as_deref(), Some("Go now"));
+}
+
+#[test]
+fn test_composite_state_holds_its_own_machine() {
+    // A state's body may contain states, its own `[*]` marker and transitions.
+    // The point is that a transition on the parent covers every substate:
+    // `Running --> Fault : EStop` replaces one line per operational state, and
+    // forgetting one of those is a silent safety bug.
+    let source = r#"
+        fsm Oven {
+            [*] --> Idle
+            state Idle
+            state Fault
+
+            state Running {
+                entry / engage_lock()
+                exit / disengage_lock()
+
+                [*] --> Heating
+                state Heating { entry / heater_on() }
+                state Holding
+                Heating --> Holding : TempReached
+            }
+
+            Idle --> Running : Start
+            Running --> Fault : EStop
+        }
+    "#;
+
+    let fsms = parse_fsm(source).expect("should parse");
+    let running = fsms[0]
+        .states
+        .iter()
+        .find(|s| s.name == "Running")
+        .expect("Running");
+
+    assert_eq!(running.state_type, StateType::Composite);
+    assert_eq!(running.entry_actions.len(), 1);
+    assert_eq!(running.exit_actions.len(), 1);
+
+    let sub = running.sub_fsm.as_ref().expect("Running should carry a sub-machine");
+    assert_eq!(sub.initial_state.as_deref(), Some("Heating"));
+    assert_eq!(sub.states.len(), 2);
+    assert_eq!(sub.transitions.len(), 1);
+
+    // The parent's own transitions stay at the level they were written.
+    assert!(fsms[0].transitions.iter().any(|t| t.source == "Running" && t.target == "Fault"));
+}
+
+#[test]
+fn test_nesting_goes_deeper_than_one_level() {
+    let fsms = parse_fsm(
+        r#"
+        fsm Deep {
+            [*] --> Outer
+            state Outer {
+                [*] --> Middle
+                state Middle {
+                    [*] --> Inner
+                    state Inner
+                }
+            }
+        }
+    "#,
+    )
+    .expect("should parse");
+
+    let outer = &fsms[0].states[0];
+    let middle = &outer.sub_fsm.as_ref().unwrap().states[0];
+    assert_eq!(middle.name, "Middle");
+    assert_eq!(middle.state_type, StateType::Composite);
+    assert_eq!(
+        middle.sub_fsm.as_ref().unwrap().initial_state.as_deref(),
+        Some("Inner")
+    );
+}
+
+#[test]
+fn test_a_state_without_nesting_stays_simple() {
+    // Entry and exit actions alone must not turn a state composite.
+    let fsms = parse_fsm(
+        r#"
+        fsm Plain {
+            [*] --> A
+            state A { entry / f() exit / g() Tick / h() }
+            state B
+            A --> B : Go
+        }
+    "#,
+    )
+    .expect("should parse");
+
+    let a = &fsms[0].states.iter().find(|s| s.name == "A").unwrap();
+    assert_eq!(a.state_type, StateType::Simple);
+    assert!(a.sub_fsm.is_none());
 }
