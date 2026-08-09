@@ -137,7 +137,8 @@ fn parse_fsm_item(pair: pest::iterators::Pair<Rule>, fsm: &mut FsmDefinition) ->
                 let already_has_a_body = existing.description.is_some()
                     || !existing.entry_actions.is_empty()
                     || !existing.exit_actions.is_empty()
-                    || !existing.internal_transitions.is_empty();
+                    || !existing.internal_transitions.is_empty()
+                    || existing.sub_fsm.is_some();
 
                 if already_has_a_body {
                     return Err(ParseError::SyntaxError {
@@ -153,6 +154,10 @@ fn parse_fsm_item(pair: pest::iterators::Pair<Rule>, fsm: &mut FsmDefinition) ->
                 existing.entry_actions.extend(state.entry_actions);
                 existing.exit_actions.extend(state.exit_actions);
                 existing.internal_transitions.extend(state.internal_transitions);
+                // A transition creates its endpoints implicitly and flat, so a
+                // state declared afterwards is where the nesting arrives.
+                existing.state_type = state.state_type;
+                existing.sub_fsm = state.sub_fsm;
             } else {
                 fsm.states.push(state);
             }
@@ -190,7 +195,21 @@ fn parse_timer_def(pair: pest::iterators::Pair<Rule>) -> ParseResult<Timer> {
     let mut inner = pair.into_inner();
 
     let name = inner.next().unwrap().as_str().to_string();
-    let duration_ms: u32 = inner.next().unwrap().as_str().parse().unwrap_or(1000);
+
+    let duration_pair = inner.next().unwrap();
+    let line = duration_pair.line_col().0;
+    let written = duration_pair.as_str();
+    // Was `.unwrap_or(1000)`: a duration too large for u32 silently became one
+    // second, which is the kind of substitution firmware should never make on
+    // its own.
+    let duration_ms: u32 = written.parse().map_err(|_| ParseError::SyntaxError {
+        line,
+        message: format!(
+            "timer '{name}' has duration {written}, which does not fit in u32 \
+             (maximum {})",
+            u32::MAX
+        ),
+    })?;
     
     // Skip arrow token if present
     let mut event_name = inner.next().unwrap().as_str().to_string();
@@ -344,9 +363,78 @@ fn parse_state_definition(pair: pest::iterators::Pair<Rule>) -> ParseResult<Stat
     Ok(state)
 }
 
+/// Parses one already-unwrapped body item — a state or a transition.
+///
+/// `parse_fsm_item` expects the `fsm_item` wrapper; inside a composite state the
+/// wrapper is `nested_item`, so the inner pair is handed over directly.
+fn parse_fsm_item_inner(
+    inner: pest::iterators::Pair<Rule>,
+    fsm: &mut FsmDefinition,
+) -> ParseResult<()> {
+    match inner.as_rule() {
+        Rule::initial_state => {
+            let target = inner.into_inner().last().unwrap().as_str().to_string();
+            fsm.initial_state = Some(target);
+        }
+        Rule::state_simple | Rule::state_with_body => {
+            let line = inner.line_col().0;
+            let state = parse_state_definition(inner)?;
+            if let Some(existing) = fsm.states.iter_mut().find(|s| s.name == state.name) {
+                let already_has_a_body = existing.description.is_some()
+                    || !existing.entry_actions.is_empty()
+                    || !existing.exit_actions.is_empty()
+                    || !existing.internal_transitions.is_empty()
+                    || existing.sub_fsm.is_some();
+                if already_has_a_body {
+                    return Err(ParseError::SyntaxError {
+                        line,
+                        message: format!(
+                            "state '{}' is declared more than once; merge the declarations",
+                            state.name
+                        ),
+                    });
+                }
+                existing.description = state.description;
+                existing.entry_actions.extend(state.entry_actions);
+                existing.exit_actions.extend(state.exit_actions);
+                existing.internal_transitions.extend(state.internal_transitions);
+                existing.state_type = state.state_type;
+                existing.sub_fsm = state.sub_fsm;
+            } else {
+                fsm.states.push(state);
+            }
+        }
+        Rule::transition => {
+            let transition = parse_transition(inner)?;
+            for endpoint in [&transition.source, &transition.target] {
+                if endpoint != "[*]"
+                    && !endpoint.starts_with("<<")
+                    && !fsm.states.iter().any(|s| s.name == *endpoint)
+                {
+                    fsm.states.push(State::new(endpoint, StateType::Simple));
+                }
+            }
+            fsm.transitions.push(transition);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn parse_state_body_item(pair: pest::iterators::Pair<Rule>, state: &mut State) -> ParseResult<()> {
     let action_item = pair.into_inner().next().unwrap();
     match action_item.as_rule() {
+        // A nested state or transition makes this a composite state: it holds a
+        // machine of its own, parsed by the same code as the top level.
+        Rule::nested_item => {
+            let inner = action_item.into_inner().next().unwrap();
+            if state.sub_fsm.is_none() {
+                state.state_type = StateType::Composite;
+                state.sub_fsm = Some(FsmDefinition::new(state.name.clone()));
+            }
+            let sub = state.sub_fsm.as_mut().unwrap();
+            parse_fsm_item_inner(inner, sub)?;
+        }
         Rule::entry_action => {
             let action = parse_action_call(action_item.into_inner().next().unwrap())?;
             state.entry_actions.push(action);
