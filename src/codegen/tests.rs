@@ -1314,3 +1314,78 @@ fn test_transition_into_a_choice_gets_a_note_instead_of_a_test() {
         "expected a note explaining the skipped test:\n{code}"
     );
 }
+
+const TIMERS: &str = r#"
+    fsm Blink {
+        timer watchdog = 5000 -> WatchdogExpired
+        timer heartbeat = 1000 -> Beat periodic
+
+        [*] --> On
+        state On { entry / led_on() entry / start_timer(heartbeat) }
+        state Off { entry / led_off() }
+        On --> Off : Beat
+        Off --> On : Beat
+    }
+"#;
+
+#[test]
+fn test_timer_events_reach_the_event_enum() {
+    // `WatchdogExpired` is named by no transition, so it was absent from the
+    // enum and the caller had nothing to pass to `process` when it fired.
+    let code = generate(TIMERS);
+
+    let events = code
+        .split("pub enum BlinkEvent {")
+        .nth(1)
+        .expect("event enum missing");
+    let events = events.split('}').next().unwrap();
+
+    assert!(events.contains("Beat,"));
+    assert!(
+        events.contains("WatchdogExpired,"),
+        "a timer's event must be dispatchable even with no transition using it:\n{events}"
+    );
+}
+
+#[test]
+fn test_timer_descriptor_carries_duration_mode_and_event() {
+    let code = generate(TIMERS);
+
+    assert!(code.contains("pub enum BlinkTimer {"));
+    assert!(code.contains("BlinkTimer::Watchdog => 5000,"));
+    assert!(code.contains("BlinkTimer::Heartbeat => 1000,"));
+    // Periodic is the declared mode, not a guess.
+    assert!(code.contains("BlinkTimer::Watchdog => false,"));
+    assert!(code.contains("BlinkTimer::Heartbeat => true,"));
+    assert!(code.contains("BlinkTimer::Watchdog => BlinkEvent::WatchdogExpired,"));
+    // The DSL name, so a timer action's argument can be matched back.
+    assert!(code.contains(r#"BlinkTimer::Heartbeat => "heartbeat","#));
+}
+
+#[test]
+fn test_timer_actions_keep_naming_their_timer() {
+    // Starting and stopping stays with the author's own actions, which carry
+    // the timer name since action parameters landed.
+    let code = generate(TIMERS);
+
+    assert!(code.contains("fn start_timer(&mut self, arg1: &str);"));
+    assert!(code.contains(r#"self.context.start_timer("heartbeat");"#));
+}
+
+#[test]
+fn test_no_timer_descriptor_without_timers() {
+    // Nothing to describe, nothing emitted.
+    let code = generate(CONNECTION_MANAGER_NO_TIMERS);
+    assert!(!code.contains("Timer {"), "unexpected timer enum:\n{code}");
+}
+
+/// The connection manager without its timer declarations.
+const CONNECTION_MANAGER_NO_TIMERS: &str = r#"
+    fsm Plain {
+        [*] --> Disconnected
+        state Disconnected { entry / reset_connection() }
+        state Connected
+        Disconnected --> Connected : Connect
+        Connected --> Disconnected : Disconnect
+    }
+"#;

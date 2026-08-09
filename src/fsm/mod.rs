@@ -60,6 +60,15 @@ impl FsmDefinition {
             }
         }
 
+        // A declared timer fires an event, and that event has to be
+        // dispatchable even when no transition mentions it yet — otherwise the
+        // caller has nothing to pass to `process` when the timer expires.
+        for timer in &self.timers {
+            if !events.iter().any(|e| e.name == timer.event.name) {
+                events.push(timer.event.clone());
+            }
+        }
+
         // Deduplicate
         events.sort_by(|a, b| a.name.cmp(&b.name));
         events.dedup_by(|a, b| a.name == b.name);
