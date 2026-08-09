@@ -1389,3 +1389,33 @@ const CONNECTION_MANAGER_NO_TIMERS: &str = r#"
         Connected --> Disconnected : Disconnect
     }
 "#;
+
+#[test]
+fn test_a_state_reached_only_through_a_choice_is_not_called_unreachable() {
+    // A choice point is not a state: what it reaches are its branches' targets.
+    // Treating `<<Name>>` as the destination made every state reachable only via
+    // a choice look orphaned — a warning pointing at nothing.
+    let code = generate(
+        r#"
+        fsm Probe {
+            [*] --> Deciding
+            state Deciding
+            state Accepted
+            state Rejected
+            Deciding --> <<Verdict>> : Check
+            Accepted --> Deciding : Again
+            Rejected --> Deciding : Again
+
+            choice Verdict {
+                [ok] -> Accepted
+                [else] -> Rejected
+            }
+        }
+    "#,
+    );
+
+    assert!(
+        !code.contains("// Warning:"),
+        "states behind a choice point reported as unreachable:\n{code}"
+    );
+}
