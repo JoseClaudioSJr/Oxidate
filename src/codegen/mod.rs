@@ -339,6 +339,13 @@ fn generate_standard_code(fsm: &FsmDefinition) -> String {
     code.push_str(&generate_event_enum(fsm));
     code.push_str("\n");
     
+    // Timer metadata, when the machine declares any.
+    let timers = generate_timer_enum(fsm);
+    if !timers.is_empty() {
+        code.push_str(&timers);
+        code.push_str("\n");
+    }
+
     // Generate FSM struct
     code.push_str(&generate_fsm_struct(fsm));
     code.push_str("\n");
@@ -828,6 +835,106 @@ fn collect_action_idents(fsm: &FsmDefinition) -> Vec<String> {
 }
 
 
+/// Describes the timers a machine declares.
+///
+/// The generator states *what* the machine needs — how long, whether it repeats,
+/// and which event it feeds back — and stops there. Driving a real clock is the
+/// integrator's job: on a `no_std` target there is no way to know whether that is
+/// `embassy_time`, a SysTick, or an RTC, and guessing would tie the generated
+/// code to a runtime contract it cannot honour.
+///
+/// Starting and stopping stays with the author's own actions
+/// (`entry / start_timer(watchdog)`), which now carry the timer's name.
+fn generate_timer_enum(fsm: &FsmDefinition) -> String {
+    if fsm.timers.is_empty() {
+        return String::new();
+    }
+
+    let name = &fsm.name;
+    let mut code = String::new();
+
+    code.push_str(&format!(
+        "/// Timers declared by `{name}`.\n\
+         ///\n\
+         /// Wiring these to a clock is up to the integrator. When one expires,\n\
+         /// feed `event()` into `process`.\n"
+    ));
+    code.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n");
+    code.push_str(&format!("pub enum {name}Timer {{\n"));
+    for timer in &fsm.timers {
+        code.push_str(&format!(
+            "    /// {} ms{}\n",
+            timer.duration_ms,
+            match timer.mode {
+                crate::fsm::TimerMode::Periodic => ", repeating",
+                crate::fsm::TimerMode::OneShot => ", one-shot",
+            }
+        ));
+        code.push_str(&format!("    {},\n", to_pascal_case(&timer.name)));
+    }
+    code.push_str("}\n\n");
+
+    code.push_str(&format!("impl {name}Timer {{\n"));
+    code.push_str(&format!(
+        "    /// Every timer this machine declares.\n    pub const ALL: &'static [{name}Timer] = &[\n"
+    ));
+    for timer in &fsm.timers {
+        code.push_str(&format!(
+            "        {name}Timer::{},\n",
+            to_pascal_case(&timer.name)
+        ));
+    }
+    code.push_str("    ];\n\n");
+
+    code.push_str("    /// How long it runs, in milliseconds.\n");
+    code.push_str("    pub const fn duration_ms(self) -> u32 {\n        match self {\n");
+    for timer in &fsm.timers {
+        code.push_str(&format!(
+            "            {name}Timer::{} => {},\n",
+            to_pascal_case(&timer.name),
+            timer.duration_ms
+        ));
+    }
+    code.push_str("        }\n    }\n\n");
+
+    code.push_str("    /// Whether it restarts itself after firing.\n");
+    code.push_str("    pub const fn is_periodic(self) -> bool {\n        match self {\n");
+    for timer in &fsm.timers {
+        code.push_str(&format!(
+            "            {name}Timer::{} => {},\n",
+            to_pascal_case(&timer.name),
+            matches!(timer.mode, crate::fsm::TimerMode::Periodic)
+        ));
+    }
+    code.push_str("        }\n    }\n\n");
+
+    code.push_str("    /// The event to feed into `process` when it expires.\n");
+    code.push_str(&format!(
+        "    pub const fn event(self) -> {name}Event {{\n        match self {{\n"
+    ));
+    for timer in &fsm.timers {
+        code.push_str(&format!(
+            "            {name}Timer::{} => {name}Event::{},\n",
+            to_pascal_case(&timer.name),
+            to_pascal_case(&timer.event.name)
+        ));
+    }
+    code.push_str("        }\n    }\n\n");
+
+    code.push_str("    /// The name written in the DSL, as passed to timer actions.\n");
+    code.push_str("    pub const fn as_str(self) -> &'static str {\n        match self {\n");
+    for timer in &fsm.timers {
+        code.push_str(&format!(
+            "            {name}Timer::{} => \"{}\",\n",
+            to_pascal_case(&timer.name),
+            timer.name
+        ));
+    }
+    code.push_str("        }\n    }\n}\n\n");
+
+    code
+}
+
 fn generate_state_enum(fsm: &FsmDefinition) -> String {
     let mut code = String::new();
     
@@ -850,13 +957,20 @@ fn generate_state_enum(fsm: &FsmDefinition) -> String {
     code
 }
 
+
+
 fn generate_event_enum(fsm: &FsmDefinition) -> String {
     let mut code = String::new();
     
     // `collect_events` already gathers external and internal transition events,
     // sorted and deduplicated. It existed and had no caller, while this function
     // kept its own copy of the same logic.
-    let events: Vec<String> = fsm.collect_events().into_iter().map(|e| e.name).collect();
+    let mut events: Vec<String> = fsm.collect_events().into_iter().map(|e| e.name).collect();
+    // A timer's expiry event was declared and then never reached the enum, so
+    // nothing could dispatch it.
+    events.extend(fsm.timers.iter().map(|t| t.event.name.clone()));
+    events.sort();
+    events.dedup();
 
     // Even with no events the enum has to exist: `process()` takes it as a
     // parameter, so returning early left a reference to an undefined type.
