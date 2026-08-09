@@ -48,10 +48,22 @@ state Idle
 ### State with Description
 
 ```
-state Running: "The system is actively processing"
+state Red: "Stop - wait for green"
+state Yellow: Caution
 ```
 
-The description appears as a tooltip in the GUI and as documentation in generated code.
+A description runs to the end of the line, so **nothing else may follow it on
+that line** — the quotes are optional and are stripped if present. It becomes a
+doc comment on the generated enum variant:
+
+```rust
+pub enum TrafficLightState {
+    /// Stop - wait for green
+    Red,
+    /// Caution
+    Yellow,
+}
+```
 
 ### State with Body
 
@@ -252,13 +264,37 @@ Idle --> Active : Start / begin_processing()
 
 ### Actions with Parameters
 
+An action may take string literals, whole numbers, or bare identifiers:
+
 ```
 state Logging {
     entry / log_message("Entered logging state")
 }
 
 Error --> Recovery : Reset / reset_with_code(0)
+Waiting --> Idle : Cancel / stop_timer(response_timeout)
 ```
+
+Parameters reach the generated trait method. Types are inferred per position
+across every call site — all-integer stays `i64`, anything else becomes `&str`:
+
+```rust
+fn log_message(&mut self, arg1: &str);
+fn reset_with_code(&mut self, arg1: i64);
+fn stop_timer(&mut self, arg1: &str);
+```
+
+A bare identifier names something in the model — a timer, typically — and is
+passed as a string literal, since the machine has no symbol type to hand over.
+That is what keeps `start_timer(watchdog)` and `start_timer(keepalive)` apart:
+
+```rust
+self.context.start_timer("watchdog");
+self.context.start_timer("keepalive");
+```
+
+One trait method cannot vary its arguments, so an action called with different
+numbers of parameters is rejected.
 
 ### Action Naming
 
@@ -290,18 +326,38 @@ timer heartbeat = 500 -> Tick periodic
 
 ### Timer Control
 
-Control timers from within states:
+Timers are started and stopped by your own actions, which name the timer:
 
 ```
 state Waiting {
     entry / start_timer(timeout)
     exit / stop_timer(timeout)
 }
-
-// Or inline in a generic action context:
-// start_timer(timer_name)
-// stop_timer(timer_name)
 ```
+
+### What a timer generates
+
+A declared timer produces a descriptor, and its event joins the event enum even
+when no transition mentions it yet — otherwise there would be nothing to pass to
+`process` when it fires:
+
+```rust
+pub enum BlinkTimer { Watchdog, Heartbeat }
+
+impl BlinkTimer {
+    pub const ALL: &'static [BlinkTimer];
+    pub const fn duration_ms(self) -> u32;
+    pub const fn is_periodic(self) -> bool;
+    pub const fn event(self) -> BlinkEvent;
+    pub const fn as_str(self) -> &'static str;   // the name written above
+}
+```
+
+The generator states *what* the machine needs in terms of time and stops there.
+Driving a clock is yours to wire up: on a `no_std` target there is no way to know
+whether that is `embassy_time`, a SysTick or an RTC. When a timer expires, feed
+its `event()` into `process`. `as_str()` matches a timer action's argument back
+to a variant.
 
 ### Timer-Triggered Transitions
 
@@ -320,6 +376,8 @@ state LedOff {
 LedOn --> LedOff : BlinkTick
 LedOff --> LedOn : BlinkTick
 ```
+
+---
 
 ---
 
@@ -357,6 +415,22 @@ choice ValidateResult {
 2. First matching condition wins
 3. `[else]` catches all remaining cases
 4. Each branch can have an optional action
+5. A branch may target another choice point
+
+### Semantics: choice, not junction
+
+UML distinguishes two diamond pseudostates, and `choice` here is the **dynamic**
+one: control reaches it *after* the incoming transition's actions have run, and
+the first branch whose guard holds is taken. A junction — where guards take part
+in selecting the transition, before any action runs — is a different construct and
+has no keyword in this DSL.
+
+Each branch generates its own action, then the state change, then the target's
+entry actions, in that order.
+
+**With no `[else]` and no matching guard, the state is left unchanged.**
+Inventing a destination that was never written would be worse, but a missing
+`[else]` is easy to overlook, so the generated code says so in a comment.
 
 ---
 
@@ -559,6 +633,24 @@ The complete grammar is defined in `src/parser/fsm.pest`. Key rules:
 | `timer_def` | `timer name = ms -> Event [mode]` |
 | `choice_def` | `choice Name { branches }` |
 | `identifier` | `[a-zA-Z_][a-zA-Z0-9_]*` |
+
+---
+
+## Not implemented yet
+
+The model carries these and the generator ignores them. Listed so this reference
+describes the tool rather than the intention:
+
+| Construct | Status |
+|---|---|
+| Composite (nested) states | `StateType::Composite` and `State::sub_fsm` exist; nothing is generated |
+| History states (shallow and deep) | declared in `StateType`, no syntax and no code |
+| `auto_start_state` on a timer | field exists, no syntax for it |
+| Event parameters (`CoinInserted(value)`) | not supported; guards read from the context instead |
+
+`process` returns `()`. An event with no transition from the current state is
+discarded silently, so the caller cannot tell a dropped event from a handled one.
+Worth knowing when an event matters — an open issue tracks changing it.
 
 ---
 
