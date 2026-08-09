@@ -712,14 +712,31 @@ impl OxidateApp {
         // Even out where edges meet each box, then anchor every label on the
         // geometry that actually got drawn.
         distribute_endpoints(&mut edges, &boxes);
+        separate_overlapping_runs(&mut edges);
 
+        // A self-loop's label position is fixed by the loop's own geometry; the
+        // rest are chosen from candidates below.
+        let mut owners: Vec<usize> = Vec::new();
+        let mut fixed: Vec<bool> = Vec::new();
         for (edge_index, text, forced) in pending_labels {
             if text.is_empty() {
                 continue;
             }
             let pos = forced.unwrap_or_else(|| label_anchor(&edges[edge_index].points));
             labels.push(LayoutedLabel { pos, text });
+            owners.push(edge_index);
+            fixed.push(forced.is_some());
         }
+
+        let routes: Vec<Vec<egui::Pos2>> = edges.iter().map(|e| e.points.clone()).collect();
+        place_labels(
+            &mut labels,
+            &routes,
+            &owners,
+            &fixed,
+            &boxes,
+            self.layout_config.edge_label_font_size,
+        );
 
         self.layout = Some(LayoutedDiagram { edges, labels });
     }
@@ -2106,6 +2123,294 @@ fn side_of(point: egui::Pos2, rect: egui::Rect) -> BoxSide {
         .unwrap()
 }
 
+
+
+/// Chooses where each edge label sits.
+///
+/// Placing a label at a fixed point on its route and shoving whatever it hits
+/// does not converge: every shove creates the next collision. Instead each label
+/// proposes a set of positions along its own route, and the one that scores best
+/// is taken — so a bad spot is declined rather than resolved afterwards.
+///
+/// The score charges for overlapping a state box, another route, or a label
+/// already placed, and pays a small bonus for lining up with one. Labels are
+/// placed in order, so earlier ones constrain later ones; that is what makes a
+/// row of them share an edge instead of scattering.
+fn place_labels(
+    labels: &mut [LayoutedLabel],
+    routes: &[Vec<egui::Pos2>],
+    owners: &[usize],
+    fixed: &[bool],
+    boxes: &std::collections::HashMap<String, egui::Rect>,
+    font_size: f32,
+) {
+    const BOX_PENALTY: f32 = 1000.0;
+    const ROUTE_PENALTY: f32 = 120.0;
+    const LABEL_PENALTY: f32 = 400.0;
+    const DRIFT_WEIGHT: f32 = 0.6;
+    const ALIGN_BONUS: f32 = 45.0;
+    const ALIGN_TOLERANCE: f32 = 3.0;
+
+    let state_rects: Vec<egui::Rect> = boxes.values().copied().collect();
+
+    let size_of = |text: &str| {
+        let lines = text.lines().count().max(1) as f32;
+        egui::vec2(
+            label_box_width(text, font_size),
+            lines * font_size * 1.4 + 8.0,
+        )
+    };
+
+    let mut placed: Vec<egui::Rect> = Vec::new();
+
+    for index in 0..labels.len() {
+        let size = size_of(&labels[index].text);
+
+        // A self-loop encloses its label by construction; moving it would take
+        // the label outside the loop drawn around it.
+        if fixed.get(index).copied().unwrap_or(false) {
+            placed.push(egui::Rect::from_center_size(labels[index].pos, size));
+            continue;
+        }
+
+        let route = owners
+            .get(index)
+            .and_then(|owner| routes.get(*owner))
+            .cloned()
+            .unwrap_or_default();
+
+        let candidates = label_candidates(&route, size, labels[index].pos);
+        let natural = candidates.first().copied().unwrap_or(labels[index].pos);
+
+        let mut best = natural;
+        let mut best_score = f32::MAX;
+
+        for candidate in candidates {
+            let rect = egui::Rect::from_center_size(candidate, size);
+            let mut score = (candidate - natural).length() * DRIFT_WEIGHT;
+
+            for state in &state_rects {
+                if rect.intersects(*state) {
+                    score += BOX_PENALTY;
+                }
+            }
+
+            for (route_index, points) in routes.iter().enumerate() {
+                // Sitting on its own line is the point; the label's background
+                // covers it. Other routes passing underneath are the problem.
+                if owners.get(index) == Some(&route_index) {
+                    continue;
+                }
+                for pair in points.windows(2) {
+                    if segment_meets_rect(pair[0], pair[1], rect) {
+                        score += ROUTE_PENALTY;
+                    }
+                }
+            }
+
+            for other in &placed {
+                if rect.intersects(*other) {
+                    score += LABEL_PENALTY;
+                } else if (other.center().x - candidate.x).abs() < ALIGN_TOLERANCE
+                    || (other.center().y - candidate.y).abs() < ALIGN_TOLERANCE
+                {
+                    // Sharing an edge with a neighbour reads as deliberate.
+                    score -= ALIGN_BONUS;
+                }
+            }
+
+            if score < best_score {
+                best_score = score;
+                best = candidate;
+            }
+        }
+
+        // Scoring picks the least bad candidate, which on a route that hugs a
+        // state can still be one that overlaps it — and since boxes are drawn
+        // after labels, the label simply disappears behind one. Clearing a state
+        // box is therefore enforced rather than merely preferred.
+        let mut chosen = best;
+        for _ in 0..4 {
+            let rect = egui::Rect::from_center_size(chosen, size);
+            let Some(hit) = state_rects.iter().find(|r| r.intersects(rect)) else {
+                break;
+            };
+            chosen += shortest_push(rect, *hit, 8.0);
+        }
+
+        labels[index].pos = chosen;
+        placed.push(egui::Rect::from_center_size(chosen, size));
+    }
+}
+
+/// The smallest move that clears `rect` of `obstacle`, plus `gap`.
+fn shortest_push(rect: egui::Rect, obstacle: egui::Rect, gap: f32) -> egui::Vec2 {
+    let left = obstacle.left() - rect.right() - gap;
+    let right = obstacle.right() - rect.left() + gap;
+    let up = obstacle.top() - rect.bottom() - gap;
+    let down = obstacle.bottom() - rect.top() + gap;
+
+    let dx = if left.abs() <= right.abs() { left } else { right };
+    let dy = if up.abs() <= down.abs() { up } else { down };
+
+    if dx.abs() <= dy.abs() {
+        egui::vec2(dx, 0.0)
+    } else {
+        egui::vec2(0.0, dy)
+    }
+}
+
+/// Positions a label may take along its route, best guess first.
+///
+/// Along each segment at a few fractions, plus a perpendicular offset either
+/// way, so a label can step off a crowded line without leaving it.
+fn label_candidates(route: &[egui::Pos2], size: egui::Vec2, fallback: egui::Pos2) -> Vec<egui::Pos2> {
+    const FRACTIONS: [f32; 3] = [0.5, 0.35, 0.65];
+    const EPS: f32 = 0.5;
+
+    if route.len() < 2 {
+        return vec![fallback];
+    }
+
+    // Longest segment first: the label reads best on a long straight run.
+    let mut segments: Vec<(egui::Pos2, egui::Pos2)> =
+        route.windows(2).map(|p| (p[0], p[1])).collect();
+    segments.sort_by(|a, b| {
+        (b.1 - b.0)
+            .length()
+            .partial_cmp(&(a.1 - a.0).length())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut candidates = Vec::new();
+    for (a, b) in segments {
+        let vertical = (a.x - b.x).abs() < EPS;
+        // Two distances either side: a short step off the line, and a longer
+        // one for when the route runs alongside a state box.
+        let near = if vertical { size.x * 0.5 + 8.0 } else { size.y * 0.5 + 8.0 };
+        let far = near * 2.2;
+        let offsets = [0.0, near, -near, far, -far];
+
+        for fraction in FRACTIONS {
+            let along = a + (b - a) * fraction;
+            for offset in offsets {
+                candidates.push(if vertical {
+                    egui::pos2(along.x + offset, along.y)
+                } else {
+                    egui::pos2(along.x, along.y + offset)
+                });
+            }
+        }
+    }
+
+    candidates
+}
+
+/// Whether an axis-aligned segment touches a rectangle.
+fn segment_meets_rect(a: egui::Pos2, b: egui::Pos2, rect: egui::Rect) -> bool {
+    const EPS: f32 = 0.5;
+
+    if (a.x - b.x).abs() < EPS {
+        let (lo, hi) = (a.y.min(b.y), a.y.max(b.y));
+        a.x >= rect.left() && a.x <= rect.right() && lo <= rect.bottom() && hi >= rect.top()
+    } else if (a.y - b.y).abs() < EPS {
+        let (lo, hi) = (a.x.min(b.x), a.x.max(b.x));
+        a.y >= rect.top() && a.y <= rect.bottom() && lo <= rect.right() && hi >= rect.left()
+    } else {
+        // Diagonals should not exist after `orthogonalise`; treat the bounding
+        // box as a conservative approximation rather than assume.
+        egui::Rect::from_two_pos(a, b).intersects(rect)
+    }
+}
+
+/// Nudges apart route segments that lie on top of one another.
+///
+/// Endpoint distribution spaces edges along each box border, but says nothing
+/// about the runs between them: two edges could still travel the same `x` over
+/// an overlapping stretch of `y`, drawn as a single line. Crossings at right
+/// angles are unavoidable in a dense graph and are left alone — it is the
+/// collinear overlaps that mislead.
+///
+/// Only interior points move. The first and last are clipped to a box border and
+/// moving them would reintroduce the floating arrowheads.
+fn separate_overlapping_runs(edges: &mut [LayoutedEdge]) {
+    const EPS: f32 = 0.5;
+    const STEP: f32 = 14.0;
+    const ATTEMPTS: usize = 6;
+
+    // Every segment except the two that touch a box border. Those two carry the
+    // clipped endpoint, and moving them would float the arrowhead off the box.
+    //
+    // A route of only two or three points has no such segment, so it cannot be
+    // separated this way — its overlap has to be resolved by moving whatever it
+    // overlaps with.
+    let movable: Vec<(usize, usize)> = edges
+        .iter()
+        .enumerate()
+        .flat_map(|(e, edge)| {
+            (1..edge.points.len().saturating_sub(2)).map(move |i| (e, i))
+        })
+        .collect();
+
+    for (edge_index, seg) in movable {
+        for attempt in 0..ATTEMPTS {
+            let (a, b) = {
+                let pts = &edges[edge_index].points;
+                (pts[seg], pts[seg + 1])
+            };
+            let vertical = (a.x - b.x).abs() < EPS;
+            let horizontal = (a.y - b.y).abs() < EPS;
+            if !vertical && !horizontal {
+                break;
+            }
+
+            let clash = edges.iter().enumerate().any(|(other_index, other)| {
+                if other_index == edge_index {
+                    return false;
+                }
+                other.points.windows(2).any(|pair| {
+                    let (c, d) = (pair[0], pair[1]);
+                    if vertical && (c.x - d.x).abs() < EPS && (a.x - c.x).abs() < EPS {
+                        let (a0, a1) = (a.y.min(b.y), a.y.max(b.y));
+                        let (c0, c1) = (c.y.min(d.y), c.y.max(d.y));
+                        return a0 < c1 - EPS && c0 < a1 - EPS;
+                    }
+                    if horizontal && (c.y - d.y).abs() < EPS && (a.y - c.y).abs() < EPS {
+                        let (a0, a1) = (a.x.min(b.x), a.x.max(b.x));
+                        let (c0, c1) = (c.x.min(d.x), c.x.max(d.x));
+                        return a0 < c1 - EPS && c0 < a1 - EPS;
+                    }
+                    false
+                })
+            });
+
+            if !clash {
+                break;
+            }
+
+            // Alternate sides so a run does not drift steadily in one direction.
+            let offset = if attempt % 2 == 0 {
+                STEP * (attempt as f32 / 2.0 + 1.0)
+            } else {
+                -STEP * ((attempt as f32 + 1.0) / 2.0)
+            };
+            // Moving a run shifts both of its ends. The neighbouring segments
+            // absorb that by getting longer or shorter, which keeps every angle
+            // square without touching the clipped endpoints.
+            let pts = &mut edges[edge_index].points;
+            if vertical {
+                let base = pts[seg].x;
+                pts[seg].x = base + offset;
+                pts[seg + 1].x = base + offset;
+            } else {
+                let base = pts[seg].y;
+                pts[seg].y = base + offset;
+                pts[seg + 1].y = base + offset;
+            }
+        }
+    }
+}
+
 /// Spreads the endpoints meeting one side of a box evenly along it.
 ///
 /// dagre picks where each edge meets a node, and after the route has been
@@ -2120,24 +2425,28 @@ fn distribute_endpoints(
     boxes: &std::collections::HashMap<String, egui::Rect>,
 ) {
     // (box name, side, is_arrival) -> indices of edges meeting there
-    let mut groups: std::collections::HashMap<(String, BoxSide, bool), Vec<usize>> =
+    // (box, side) -> the edges meeting it, each flagged as arriving or leaving
+    let mut groups: std::collections::HashMap<(String, BoxSide), Vec<(usize, bool)>> =
         std::collections::HashMap::new();
 
     for (i, edge) in edges.iter().enumerate() {
         if edge.v == edge.w || edge.points.len() < 2 {
             continue; // self-loops carry their own geometry
         }
+        // Departures and arrivals share the border, so they share a group. Keying
+        // them apart let an outgoing edge and an incoming one be assigned the
+        // very same point, and the two ran along each other from there.
         if let Some(rect) = boxes.get(&edge.v) {
             let side = side_of(edge.points[0], *rect);
-            groups.entry((edge.v.clone(), side, false)).or_default().push(i);
+            groups.entry((edge.v.clone(), side)).or_default().push((i, false));
         }
         if let Some(rect) = boxes.get(&edge.w) {
             let side = side_of(edge.points[edge.points.len() - 1], *rect);
-            groups.entry((edge.w.clone(), side, true)).or_default().push(i);
+            groups.entry((edge.w.clone(), side)).or_default().push((i, true));
         }
     }
 
-    for ((name, side, is_arrival), mut members) in groups {
+    for ((name, side), mut members) in groups {
         if members.len() < 2 {
             continue;
         }
@@ -2146,7 +2455,7 @@ fn distribute_endpoints(
         };
 
         let horizontal_side = matches!(side, BoxSide::Top | BoxSide::Bottom);
-        let coord = |edge: &LayoutedEdge| {
+        let coord = |edge: &LayoutedEdge, is_arrival: bool| {
             let p = if is_arrival {
                 edge.points[edge.points.len() - 1]
             } else {
@@ -2162,8 +2471,8 @@ fn distribute_endpoints(
         // Keep the existing left-to-right (or top-to-bottom) order so edges
         // don't cross each other just to be evenly spaced.
         members.sort_by(|a, b| {
-            coord(&edges[*a])
-                .partial_cmp(&coord(&edges[*b]))
+            coord(&edges[a.0], a.1)
+                .partial_cmp(&coord(&edges[b.0], b.1))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
@@ -2176,7 +2485,7 @@ fn distribute_endpoints(
         };
         let count = members.len();
 
-        for (slot, edge_index) in members.into_iter().enumerate() {
+        for (slot, (edge_index, is_arrival)) in members.into_iter().enumerate() {
             let target = lo + (hi - lo) * (slot as f32 + 1.0) / (count as f32 + 1.0);
             let edge = &mut edges[edge_index];
             let n = edge.points.len();
@@ -2726,6 +3035,7 @@ mod layout_tests {
             });
         }
         distribute_endpoints(&mut edges, &boxes);
+        separate_overlapping_runs(&mut edges);
         (boxes, edges)
     }
 
@@ -2881,5 +3191,231 @@ mod layout_tests {
             assert!(!label_rect.intersects(rect), "self-loop label overlaps the state for {text:?}");
             assert!(reach >= label_rect.right(), "self-loop does not enclose its label for {text:?}");
         }
+    }
+
+
+    fn overlaps(edges: &[LayoutedEdge]) -> Vec<String> {
+        let mut segments: Vec<(String, egui::Pos2, egui::Pos2)> = Vec::new();
+        for edge in edges {
+            for pair in edge.points.windows(2) {
+                segments.push((format!("{}->{}", edge.v, edge.w), pair[0], pair[1]));
+            }
+        }
+
+        let mut found = Vec::new();
+        for i in 0..segments.len() {
+            for j in i + 1..segments.len() {
+                let (name_a, a0, a1) = &segments[i];
+                let (name_b, b0, b1) = &segments[j];
+                if name_a == name_b {
+                    continue;
+                }
+
+                let both_horizontal = (a0.y - a1.y).abs() < EPS
+                    && (b0.y - b1.y).abs() < EPS
+                    && (a0.y - b0.y).abs() < EPS;
+                if both_horizontal
+                    && a0.x.min(a1.x) < b0.x.max(b1.x) - EPS
+                    && b0.x.min(b1.x) < a0.x.max(a1.x) - EPS
+                {
+                    found.push(format!("horizontal at y={:.0}: {name_a} / {name_b}", a0.y));
+                }
+
+                let both_vertical = (a0.x - a1.x).abs() < EPS
+                    && (b0.x - b1.x).abs() < EPS
+                    && (a0.x - b0.x).abs() < EPS;
+                if both_vertical
+                    && a0.y.min(a1.y) < b0.y.max(b1.y) - EPS
+                    && b0.y.min(b1.y) < a0.y.max(a1.y) - EPS
+                {
+                    found.push(format!("vertical at x={:.0}: {name_a} / {name_b}", a0.x));
+                }
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn no_two_routes_share_a_line() {
+        let (_, edges) = routed();
+        let found = overlaps(&edges);
+        assert!(found.is_empty(), "routes drawn on top of each other: {found:#?}");
+    }
+
+    #[test]
+    fn a_departure_and_an_arrival_do_not_share_a_border_point() {
+        // Grouping them separately gave an outgoing edge and an incoming one the
+        // same point on the same side, and they ran along each other from there.
+        let (boxes, edges) = routed();
+
+        let mut used: Vec<(String, f32, f32)> = Vec::new();
+        for edge in &edges {
+            for (name, point) in [
+                (&edge.v, edge.points[0]),
+                (&edge.w, edge.points[edge.points.len() - 1]),
+            ] {
+                if !boxes.contains_key(name) {
+                    continue;
+                }
+                let clash = used.iter().any(|(other, x, y)| {
+                    other == name && (x - point.x).abs() < EPS && (y - point.y).abs() < EPS
+                });
+                assert!(!clash, "two routes meet '{name}' at the same point {point:?}");
+                used.push((name.clone(), point.x, point.y));
+            }
+        }
+    }
+
+    #[test]
+    fn labels_avoid_boxes_other_routes_and_each_other() {
+        // Three demands at once: a label may not sit on a state box, may not sit
+        // on a route other than its own, and may not sit on another label.
+        // Shoving after the fact never converged — each shove made the next
+        // collision — so positions are proposed and scored instead.
+        let boxes = door_lock_boxes();
+        let font = 12.0_f32;
+
+        let routes = vec![
+            vec![
+                egui::pos2(-40.0, 40.0),
+                egui::pos2(-40.0, 150.0),
+                egui::pos2(20.0, 150.0),
+                egui::pos2(20.0, 245.0),
+            ],
+            vec![
+                egui::pos2(30.0, 40.0),
+                egui::pos2(30.0, 150.0),
+                egui::pos2(90.0, 150.0),
+                egui::pos2(90.0, 245.0),
+            ],
+            // A route crossing the area both labels would prefer.
+            vec![egui::pos2(-200.0, 120.0), egui::pos2(200.0, 120.0)],
+        ];
+
+        let mut labels = vec![
+            LayoutedLabel { pos: egui::pos2(-10.0, 150.0), text: "cancel / return\ncoins".into() },
+            LayoutedLabel { pos: egui::pos2(60.0, 150.0), text: "coin_inserted".into() },
+        ];
+        let owners = vec![0usize, 1usize];
+        let fixed = vec![false, false];
+
+        place_labels(&mut labels, &routes, &owners, &fixed, &boxes, font);
+
+        let size = |text: &str| {
+            let lines = text.lines().count().max(1) as f32;
+            egui::vec2(label_box_width(text, font), lines * font * 1.4 + 8.0)
+        };
+
+        for (i, label) in labels.iter().enumerate() {
+            let rect = egui::Rect::from_center_size(label.pos, size(&label.text));
+
+            for (name, state) in &boxes {
+                assert!(!rect.intersects(*state), "label {i} sits on state '{name}'");
+            }
+
+            for (route_index, points) in routes.iter().enumerate() {
+                if route_index == owners[i] {
+                    continue; // its own line is what it labels
+                }
+                for pair in points.windows(2) {
+                    assert!(
+                        !segment_meets_rect(pair[0], pair[1], rect),
+                        "label {i} sits on route {route_index}"
+                    );
+                }
+            }
+
+            for (j, other) in labels.iter().enumerate() {
+                if i >= j {
+                    continue;
+                }
+                assert!(
+                    !rect.intersects(egui::Rect::from_center_size(other.pos, size(&other.text))),
+                    "labels {i} and {j} overlap"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_label_never_ends_up_behind_a_state_box() {
+        // Boxes are drawn after labels, so an overlap does not look like an
+        // overlap — the label simply vanishes. Scoring alone picks the least bad
+        // candidate, which on a route hugging a state is still one that overlaps,
+        // so clearing a box is enforced rather than preferred.
+        let mut boxes = std::collections::HashMap::new();
+        boxes.insert(
+            "Idle".to_string(),
+            egui::Rect::from_center_size(egui::pos2(0.0, 0.0), egui::vec2(240.0, 100.0)),
+        );
+
+        // A route that wraps the box: every natural candidate lands on it.
+        let routes = vec![vec![
+            egui::pos2(-60.0, 55.0),
+            egui::pos2(-60.0, 20.0),
+            egui::pos2(60.0, 20.0),
+            egui::pos2(60.0, 55.0),
+        ]];
+        let mut labels = vec![LayoutedLabel {
+            pos: egui::pos2(0.0, 20.0),
+            text: "cancel / return\ncoins".into(),
+        }];
+
+        place_labels(&mut labels, &routes, &[0], &[false], &boxes, 12.0);
+
+        let text = &labels[0].text;
+        let size = egui::vec2(
+            label_box_width(text, 12.0),
+            text.lines().count() as f32 * 12.0 * 1.4 + 8.0,
+        );
+        assert!(
+            !egui::Rect::from_center_size(labels[0].pos, size).intersects(boxes["Idle"]),
+            "label still behind the state box at {:?}",
+            labels[0].pos
+        );
+    }
+
+    #[test]
+    fn neighbouring_labels_line_up() {
+        // Two labels on parallel routes reading at different heights looks
+        // accidental. The score pays a bonus for sharing an edge with one
+        // already placed.
+        let boxes = door_lock_boxes();
+        let routes = vec![
+            vec![egui::pos2(-40.0, 40.0), egui::pos2(-40.0, 245.0)],
+            vec![egui::pos2(90.0, 40.0), egui::pos2(90.0, 245.0)],
+        ];
+        let mut labels = vec![
+            LayoutedLabel { pos: egui::pos2(-40.0, 140.0), text: "lock_cmd".into() },
+            LayoutedLabel { pos: egui::pos2(90.0, 175.0), text: "valid_key".into() },
+        ];
+
+        place_labels(
+            &mut labels,
+            &routes,
+            &[0, 1],
+            &[false, false],
+            &boxes,
+            12.0,
+        );
+
+        let dy = (labels[0].pos.y - labels[1].pos.y).abs();
+        let dx = (labels[0].pos.x - labels[1].pos.x).abs();
+        assert!(dy < 3.0 || dx < 3.0, "labels not aligned: dx={dx:.1} dy={dy:.1}");
+    }
+
+    #[test]
+    fn a_label_with_nothing_near_it_is_left_alone() {
+        // Displacement is a last resort: a label that reads fine should not move.
+        let boxes = door_lock_boxes();
+        let original = egui::pos2(900.0, 900.0);
+        let mut labels = vec![LayoutedLabel { pos: original, text: "clear".into() }];
+
+        let routes: Vec<Vec<egui::Pos2>> = Vec::new();
+        let owners = vec![0usize; labels.len()];
+        let fixed = vec![false; labels.len()];
+        place_labels(&mut labels, &routes, &owners, &fixed, &boxes, 12.0);
+
+        assert_eq!(labels[0].pos, original);
     }
 }
