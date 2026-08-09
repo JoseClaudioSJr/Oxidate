@@ -1715,6 +1715,19 @@ fn reachable_states(fsm: &FsmDefinition) -> std::collections::HashSet<String> {
             if transition.source != current || transition.target == "[*]" {
                 continue;
             }
+
+            // A choice point is not a state: what it reaches are its branches'
+            // targets. Treating `<<Name>>` as the destination made every state
+            // only reachable through a choice look orphaned.
+            if let Some(choice) = choice_target(&transition.target, fsm) {
+                for branch in &choice.branches {
+                    if branch.target != "[*]" && seen.insert(branch.target.clone()) {
+                        queue.push_back(branch.target.clone());
+                    }
+                }
+                continue;
+            }
+
             if seen.insert(transition.target.clone()) {
                 queue.push_back(transition.target.clone());
             }
