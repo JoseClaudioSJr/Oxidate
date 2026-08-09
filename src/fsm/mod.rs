@@ -164,9 +164,6 @@ impl State {
         }
     }
 
-    pub fn is_composite(&self) -> bool {
-        matches!(self.state_type, StateType::Composite)
-    }
 }
 
 /// Type of state
@@ -211,21 +208,6 @@ impl Transition {
             action: None,
             kind: TransitionKind::External,
         }
-    }
-
-    pub fn with_event(mut self, event: Event) -> Self {
-        self.event = Some(event);
-        self
-    }
-
-    pub fn with_guard(mut self, guard: Guard) -> Self {
-        self.guard = Some(guard);
-        self
-    }
-
-    pub fn with_action(mut self, action: Action) -> Self {
-        self.action = Some(action);
-        self
     }
 
     /// Format transition label for display
@@ -304,41 +286,6 @@ impl Action {
         }
     }
 
-    pub fn with_params(mut self, params: Vec<String>) -> Self {
-        self.params = params;
-        self
-    }
-}
-
-/// Runtime context for FSM execution
-#[derive(Debug, Clone)]
-pub struct FsmContext<T> {
-    /// User data associated with the FSM
-    pub data: T,
-    /// Current state name
-    pub current_state: String,
-    /// State history for history states
-    pub history: Vec<String>,
-}
-
-impl<T: Default> FsmContext<T> {
-    pub fn new(initial_state: impl Into<String>) -> Self {
-        Self {
-            data: T::default(),
-            current_state: initial_state.into(),
-            history: Vec::new(),
-        }
-    }
-}
-
-impl<T> FsmContext<T> {
-    pub fn with_data(initial_state: impl Into<String>, data: T) -> Self {
-        Self {
-            data,
-            current_state: initial_state.into(),
-            history: Vec::new(),
-        }
-    }
 }
 
 // ============================================================================
@@ -371,15 +318,6 @@ impl Timer {
         }
     }
     
-    pub fn periodic(mut self) -> Self {
-        self.mode = TimerMode::Periodic;
-        self
-    }
-    
-    pub fn auto_start_in(mut self, state: impl Into<String>) -> Self {
-        self.auto_start_state = Some(state.into());
-        self
-    }
 }
 
 /// Timer mode
@@ -415,23 +353,6 @@ impl ChoicePoint {
         }
     }
     
-    pub fn add_branch(mut self, guard: impl Into<String>, target: impl Into<String>) -> Self {
-        self.branches.push(ChoiceBranch {
-            guard: Guard::new(guard),
-            target: target.into(),
-            action: None,
-        });
-        self
-    }
-    
-    pub fn add_else(mut self, target: impl Into<String>) -> Self {
-        self.branches.push(ChoiceBranch {
-            guard: Guard::new("else"),
-            target: target.into(),
-            action: None,
-        });
-        self
-    }
 }
 
 /// A branch from a choice point

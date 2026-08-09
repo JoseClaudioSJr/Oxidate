@@ -514,40 +514,6 @@ fn parse_state_body_item(pair: pest::iterators::Pair<Rule>, state: &mut State) -
     Ok(())
 }
 
-#[allow(dead_code)]
-fn parse_state_body(pair: pest::iterators::Pair<Rule>, state: &mut State) -> ParseResult<()> {
-    for item in pair.into_inner() {
-        match item.as_rule() {
-            Rule::state_body_item => {
-                parse_state_body_item(item, state)?;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn parse_hierarchical_state(pair: pest::iterators::Pair<Rule>) -> ParseResult<State> {
-    let mut inner = pair.into_inner();
-    let name = inner.next().unwrap().as_str().to_string();
-
-    let mut state = State::new(&name, StateType::Composite);
-    state.sub_fsm = Some(FsmDefinition::new(format!("{}_sub", name)));
-
-    for item in inner {
-        match item.as_rule() {
-            Rule::fsm_item => {
-                if let Some(ref mut sub_fsm) = state.sub_fsm {
-                    parse_fsm_item(item, sub_fsm)?;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    Ok(state)
-}
 
 fn parse_transition(pair: pest::iterators::Pair<Rule>) -> ParseResult<Transition> {
     let mut inner = pair.into_inner();
@@ -615,7 +581,3 @@ fn parse_action_call(pair: pest::iterators::Pair<Rule>) -> ParseResult<Action> {
     Ok(Action { name, params })
 }
 
-#[allow(dead_code)]
-fn parse_action_body(pair: pest::iterators::Pair<Rule>) -> ParseResult<Action> {
-    parse_action_call(pair)
-}
