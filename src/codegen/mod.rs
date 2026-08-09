@@ -346,6 +346,9 @@ fn generate_standard_code(fsm: &FsmDefinition) -> String {
         code.push_str("\n");
     }
 
+    // Error type for `process`
+    code.push_str(&generate_unhandled_event(fsm));
+
     // Generate FSM struct
     code.push_str(&generate_fsm_struct(fsm));
     code.push_str("\n");
@@ -441,7 +444,7 @@ fn generate_usage_doc(fsm: &FsmDefinition) -> String {
         };
         doc.push_str("///\n");
         doc.push_str(&format!(
-            "/// machine.process({name}Event::{});\n",
+            "/// machine.process({name}Event::{})?;\n",
             to_pascal_case(&event.name)
         ));
         doc.push_str(&format!(
@@ -449,8 +452,8 @@ fn generate_usage_doc(fsm: &FsmDefinition) -> String {
         ));
     }
     doc.push_str("/// ```\n///\n");
-    doc.push_str("/// `process` silently ignores an event with no transition from the current\n");
-    doc.push_str("/// state, so the caller cannot tell a dropped event from a handled one.\n");
+    doc.push_str("/// `process` returns `Err` when no transition applies, carrying the state and\n");
+    doc.push_str("/// the event, so a dropped event can be counted or logged.\n");
 
     doc
 }
@@ -633,7 +636,7 @@ fn generate_test_module(fsm: &FsmDefinition) -> String {
 
         for step in path {
             code.push_str(&format!(
-                "        machine.process({name}Event::{});\n",
+                "        machine.process({name}Event::{}).expect(\"path step should apply\");\n",
                 to_pascal_case(step)
             ));
         }
@@ -650,7 +653,7 @@ fn generate_test_module(fsm: &FsmDefinition) -> String {
         code.push_str("        machine.context_mut().calls.clear();\n\n");
 
         code.push_str(&format!(
-            "        machine.process({name}Event::{});\n\n",
+            "        machine.process({name}Event::{}).expect(\"the transition under test should apply\");\n\n",
             to_pascal_case(&event.name)
         ));
         code.push_str(&format!(
@@ -689,6 +692,49 @@ fn generate_test_module(fsm: &FsmDefinition) -> String {
         code.push_str("    }\n\n");
     }
 
+    // ---- an event that does not apply --------------------------------------
+    //
+    // The whole point of the `Result`: a dropped event used to be invisible.
+    if let Some(initial) = &fsm.initial_state {
+        let events: Vec<String> = fsm.collect_events().into_iter().map(|e| e.name).collect();
+        let handled: Vec<String> = fsm
+            .transitions
+            .iter()
+            .filter(|t| t.source == *initial)
+            .filter_map(|t| t.event.as_ref().map(|e| e.name.clone()))
+            .chain(
+                fsm.states
+                    .iter()
+                    .filter(|s| s.name == *initial)
+                    .flat_map(|s| s.internal_transitions.iter())
+                    .filter_map(|t| t.event.as_ref().map(|e| e.name.clone())),
+            )
+            .collect();
+
+        if let Some(stray) = events.iter().find(|e| !handled.contains(e)) {
+            code.push_str("    #[test]\n    fn an_event_that_does_not_apply_is_reported() {\n");
+            code.push_str(&format!(
+                "        let mut machine = {name}::new(Recorder::new());\n"
+            ));
+            code.push_str(&format!(
+                "        let outcome = machine.process({name}Event::{});\n\n",
+                to_pascal_case(stray)
+            ));
+            code.push_str(&format!(
+                "        assert_eq!(\n            outcome,\n            Err({name}UnhandledEvent {{\n                state: {name}State::{},\n                event: {name}Event::{},\n            }})\n        );\n",
+                to_pascal_case(initial),
+                to_pascal_case(stray)
+            ));
+            code.push_str("        // Nothing ran, and the machine stayed put.\n");
+            code.push_str(&format!(
+                "        assert_eq!(machine.state(), {name}State::{});\n",
+                to_pascal_case(initial)
+            ));
+            code.push_str("        assert!(machine.context().calls.is_empty());\n");
+            code.push_str("    }\n\n");
+        }
+    }
+
     // ---- one test per internal transition ---------------------------------
     for state in &fsm.states {
         for internal in &state.internal_transitions {
@@ -710,7 +756,7 @@ fn generate_test_module(fsm: &FsmDefinition) -> String {
             ));
             for step in path {
                 code.push_str(&format!(
-                    "        machine.process({name}Event::{});\n",
+                    "        machine.process({name}Event::{}).expect(\"path step should apply\");\n",
                     to_pascal_case(step)
                 ));
             }
@@ -720,7 +766,7 @@ fn generate_test_module(fsm: &FsmDefinition) -> String {
             ));
             code.push_str("        machine.context_mut().calls.clear();\n\n");
             code.push_str(&format!(
-                "        machine.process({name}Event::{});\n\n",
+                "        machine.process({name}Event::{}).expect(\"internal transition should apply\");\n\n",
                 to_pascal_case(&event.name)
             ));
             code.push_str("        // Internal transition: no exit, no entry, no state change.\n");
@@ -988,6 +1034,35 @@ fn generate_event_enum(fsm: &FsmDefinition) -> String {
     code
 }
 
+/// The error `process` returns when no transition applies.
+///
+/// Carries both halves of the decision so the caller can count, log or assert on
+/// it. `Copy` and allocation-free, so it costs nothing on an embedded target.
+fn generate_unhandled_event(fsm: &FsmDefinition) -> String {
+    let name = &fsm.name;
+    let mut code = String::new();
+
+    code.push_str(&format!(
+        "/// Returned by [`{name}::process`] when the event does not apply.\n"
+    ));
+    code.push_str("#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]\n");
+    code.push_str(&format!("pub struct {name}UnhandledEvent {{\n"));
+    code.push_str(&format!("    /// The state the machine was in.\n    pub state: {name}State,\n"));
+    code.push_str(&format!("    /// The event that found no transition.\n    pub event: {name}Event,\n"));
+    code.push_str("}\n\n");
+
+    // `core::fmt`, not `std`, so the generated code stays no_std-friendly.
+    code.push_str(&format!(
+        "impl core::fmt::Display for {name}UnhandledEvent {{\n\
+         \x20   fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {{\n\
+         \x20       write!(f, \"no transition for {{:?}} in state {{:?}}\", self.event, self.state)\n\
+         \x20   }}\n\
+         }}\n\n"
+    ));
+
+    code
+}
+
 fn generate_fsm_struct(fsm: &FsmDefinition) -> String {
     let mut code = String::new();
 
@@ -1085,7 +1160,14 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
     let mut code = String::new();
     let signatures = action_signatures(fsm);
     
-    code.push_str(&format!("    pub fn process(&mut self, event: {}Event) {{\n", fsm.name));
+    code.push_str("    /// Feeds an event to the machine.\n");
+    code.push_str("    ///\n");
+    code.push_str("    /// Returns `Err` when no transition applies from the current state, so a\n");
+    code.push_str("    /// dropped event can be counted or logged rather than passing unnoticed.\n");
+    code.push_str(&format!(
+        "    pub fn process(&mut self, event: {}Event) -> Result<(), {}UnhandledEvent> {{\n",
+        fsm.name, fsm.name
+    ));
     code.push_str("        match (self.state, event) {\n");
 
     // Internal transitions are emitted first: per UML semantics they take
@@ -1117,6 +1199,7 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
             }
 
             code.push_str("                // Internal transition: state unchanged\n");
+            code.push_str("                Ok(())\n");
             code.push_str("            }\n");
         }
     }
@@ -1213,7 +1296,8 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
                     }
                 }
             }
-            
+
+            code.push_str("                Ok(())\n");
             code.push_str("            }\n");
         }
     }
@@ -1225,7 +1309,10 @@ fn generate_process_event(fsm: &FsmDefinition) -> String {
     // dead code and makes the generated crate warn on `unreachable_patterns` —
     // which breaks anyone building with `-D warnings`.
     if !is_match_exhaustive(fsm) {
-        code.push_str("            _ => {} // No transition\n");
+        code.push_str(&format!(
+            "            _ => Err({}UnhandledEvent {{ state: self.state, event }}),\n",
+            fsm.name
+        ));
     }
     code.push_str("        }\n");
     code.push_str("    }\n");
@@ -1715,19 +1802,6 @@ fn reachable_states(fsm: &FsmDefinition) -> std::collections::HashSet<String> {
             if transition.source != current || transition.target == "[*]" {
                 continue;
             }
-
-            // A choice point is not a state: what it reaches are its branches'
-            // targets. Treating `<<Name>>` as the destination made every state
-            // only reachable through a choice look orphaned.
-            if let Some(choice) = choice_target(&transition.target, fsm) {
-                for branch in &choice.branches {
-                    if branch.target != "[*]" && seen.insert(branch.target.clone()) {
-                        queue.push_back(branch.target.clone());
-                    }
-                }
-                continue;
-            }
-
             if seen.insert(transition.target.clone()) {
                 queue.push_back(transition.target.clone());
             }

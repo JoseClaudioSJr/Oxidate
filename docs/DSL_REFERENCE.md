@@ -648,9 +648,9 @@ describes the tool rather than the intention:
 | `auto_start_state` on a timer | field exists, no syntax for it |
 | Event parameters (`CoinInserted(value)`) | not supported; guards read from the context instead |
 
-`process` returns `()`. An event with no transition from the current state is
-discarded silently, so the caller cannot tell a dropped event from a handled one.
-Worth knowing when an event matters — an open issue tracks changing it.
+`process` returns `Result<(), <Fsm>UnhandledEvent>`. An event with no transition
+from the current state comes back as `Err`, carrying the state and the event, so
+a dropped one can be counted or logged rather than passing unnoticed.
 
 ---
 
